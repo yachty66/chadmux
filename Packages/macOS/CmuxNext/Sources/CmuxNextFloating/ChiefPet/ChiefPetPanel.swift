@@ -34,6 +34,8 @@ public final class ChiefPetPanel: NSPanel, NSWindowDelegate {
     var visibleFrame: () -> CGRect? = { nil }
     /// The pet was pulled back on its screen after a screen change (the bubble and reply box take their side again).
     var onKeptOnScreen: (() -> Void)?
+    /// The pet was shown, hidden, covered or uncovered (another window, the screen asleep): its frames stop or go on.
+    var onVisibilityChange: (() -> Void)?
     /// The didChangeScreenParameters observer's token, kept for the panel's life.
     private var screenObserver: MainActorObservation?
 
@@ -116,15 +118,27 @@ public final class ChiefPetPanel: NSPanel, NSWindowDelegate {
         }
         // Never key, never activating: it shows over the frontmost app and leaves it in front.
         orderFrontRegardless()
+        onVisibilityChange?()
     }
 
     func dismiss() {
         orderOut(nil)
+        onVisibilityChange?()
     }
 
     /// A screen change (a display unplugged, the pet dragged onto another) keeps it on its screen.
     public func windowDidChangeScreen(_ notification: Notification) {
         keepOnScreen()
+    }
+
+    public func windowDidChangeOcclusionState(_ notification: Notification) {
+        onVisibilityChange?()
+    }
+
+    /// Whether the pet faces right: toward the nearer side of its screen, the side it is docked toward.
+    var facesRight: Bool {
+        guard let visible = visibleFrame() else { return true }
+        return frame.midX >= visible.midX
     }
 
     /// Pulls the pet fully back on its screen. Not during a drag: AppKit reports the screen change as
@@ -168,6 +182,8 @@ final class ChiefPetView: NSView {
     private let badgeView = ChiefPetBadge()
     /// The pixel character, drawn by a layer so it scales up with whole pixels.
     private let character = ChiefPetCharacter()
+    /// An animated character's frames, over the character's box (hidden for a still character).
+    let sprite = ChiefPetSpriteLayer()
     /// Where the press started, in screen points, the panel's origin then, and whether it was on the character.
     private var press: (start: CGPoint, origin: CGPoint, onCharacter: Bool)?
     private var dragging = false
@@ -180,6 +196,7 @@ final class ChiefPetView: NSView {
         character.layer?.contentsGravity = .resizeAspect
         character.layer?.magnificationFilter = .nearest
         character.layer?.minificationFilter = .trilinear
+        character.layer?.addSublayer(sprite.layer)
         addSubview(character)
         addSubview(rail)
         badgeView.isHidden = true
@@ -199,13 +216,21 @@ final class ChiefPetView: NSView {
     required init?(coder: NSCoder) { nil }
 
     var image: NSImage? {
-        didSet { character.layer?.contents = image }
+        didSet { character.layer?.contents = sprite.layer.isHidden ? image : nil }
+    }
+
+    /// Draws an animated character's `state` (nil: the still `image`), facing right or left, its row
+    /// stepping while `moving`. A still character keeps `image` and never moves.
+    func animate(_ animated: ChiefPetSprite?, state: ChiefPetState, facingRight right: Bool, moving: Bool) {
+        sprite.show(animated, state: state, facingRight: right, moving: moving)
+        character.layer?.contents = animated == nil ? image : nil
     }
 
     override func layout() {
         super.layout()
         let size = ChiefPetPanel.characterSize
         character.frame = CGRect(x: ((bounds.width - size.width) / 2).rounded(), y: bounds.height - size.height, width: size.width, height: size.height)
+        sprite.layer.frame = character.bounds
         let width = rail.width
         rail.frame = CGRect(x: ((bounds.width - width) / 2).rounded(), y: 0, width: width, height: ChiefPetRail.height)
         let badge = badgeView.fittingSize

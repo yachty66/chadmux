@@ -1,6 +1,8 @@
+import CmuxNextAgentLanes
 import CmuxNextBridge
 import CmuxNextChiefPetWiring
 import CmuxNextDaemon
+import CmuxNextDesignTokens
 import CmuxNextFloating
 import CmuxNextSettings
 
@@ -13,7 +15,18 @@ extension NotificationCenterService {
         let pet = ChiefPetRoutes(services: services).makePet()
         chiefPet = pet
         pet.start(enabled: { [weak settings] in settings?.snapshot.homeChiefPetEnabled ?? false },
-                  mascot: { [weak settings] in settings?.snapshot.homeChiefPetMascot ?? "" })
+                  mascot: { [weak settings] in settings?.snapshot.homeChiefPetMascot ?? "" },
+                  state: { Self.chiefPetState(ChiefSidebar.shared.status.activity) })
+    }
+
+    /// The Chief's sidebar status as the pet draws it: working, waiting on you, failed, else idle.
+    nonisolated static func chiefPetState(_ activity: StatusIndicatorState) -> ChiefPetState {
+        switch activity {
+        case .working, .busy: .working
+        case .waiting: .waiting
+        case .error: .error
+        case .idle, .paused, .success: .idle
+        }
     }
 
     /// An arrival that stays unread goes to the Chief pet when it would alert here, by a banner's
