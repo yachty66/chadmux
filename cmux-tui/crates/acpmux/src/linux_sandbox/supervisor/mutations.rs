@@ -1,7 +1,6 @@
-//! Name and metadata operations. The caller holds both transaction locks.
-//! Local loops consume fixed arrays or bounded copied buffers.
-//! Stricter: directory renames are refused until subtree policy checks exist;
-//! checking two directory names alone can move allowed contents to denied names.
+//! Name and metadata operations; the caller holds both transaction locks.
+//! Loops end after fixed arrays/buffers. Directory renames are refused because
+//! checking only two names cannot protect descendants moved into persistence paths.
 use super::*;
 
 const FCHMODAT2: c_long = 452;
