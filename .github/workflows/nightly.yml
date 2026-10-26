@@ -2750,6 +2750,32 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.decide.outputs.head_sha }}
 
+      # Release App first, github.token as the fallback (scripts/ci/gh_app_token.sh): the App is
+      # its own actor, so a limit that every workflow's github.token shares does not refuse it.
+      - name: Mint the release App token for this job's gh calls
+        id: gh-app-token
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CMUX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.CMUX_RELEASE_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Send this job's gh calls as the release App, github.token as the fallback
+        env:
+          GH_APP_TOKEN: ${{ steps.gh-app-token.outputs.token }}
+          GH_FALLBACK_TOKEN: ${{ github.token }}
+        # This job's timeout leaves room for 10 minutes of backoff (gh_app_token.sh reads the
+        # cap from GH_BUDGET_WAIT_MAX_SECONDS).
+        run: |
+          if [ -f scripts/ci/gh_app_token.sh ]; then
+            bash scripts/ci/gh_app_token.sh --install
+            echo "GH_BUDGET_WAIT_MAX_SECONDS=600" >> "$GITHUB_ENV"
+          fi
+
       - name: Download nightly variant artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -2875,6 +2901,7 @@ jobs:
         if: needs.decide.outputs.should_publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_APP_TOKEN: ${{ steps.gh-app-token.outputs.token }} # the uploader: App first, GH_TOKEN as fallback
         run: |
           python3 scripts/ci/publish-release-assets.py \
             --repo "$GITHUB_REPOSITORY" --tag "$CHANNEL_RELEASE_TAG" \
@@ -3065,6 +3092,32 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.decide.outputs.head_sha }}
 
+      # Release App first, github.token as the fallback (scripts/ci/gh_app_token.sh): the App is
+      # its own actor, so a limit that every workflow's github.token shares does not refuse it.
+      - name: Mint the release App token for this job's gh calls
+        id: gh-app-token
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CMUX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.CMUX_RELEASE_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+
+      - name: Send this job's gh calls as the release App, github.token as the fallback
+        env:
+          GH_APP_TOKEN: ${{ steps.gh-app-token.outputs.token }}
+          GH_FALLBACK_TOKEN: ${{ github.token }}
+        # This job's timeout leaves room for 10 minutes of backoff (gh_app_token.sh reads the
+        # cap from GH_BUDGET_WAIT_MAX_SECONDS).
+        run: |
+          if [ -f scripts/ci/gh_app_token.sh ]; then
+            bash scripts/ci/gh_app_token.sh --install
+            echo "GH_BUDGET_WAIT_MAX_SECONDS=600" >> "$GITHUB_ENV"
+          fi
+
       - name: Select Xcode
         run: ./scripts/select-ci-xcode.sh
 
@@ -3149,6 +3202,32 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.decide.outputs.head_sha }}
 
+      # Release App first, github.token as the fallback (scripts/ci/gh_app_token.sh): the App is
+      # its own actor, so a limit that every workflow's github.token shares does not refuse it.
+      - name: Mint the release App token for this job's gh calls
+        id: gh-app-token
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CMUX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.CMUX_RELEASE_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Send this job's gh calls as the release App, github.token as the fallback
+        env:
+          GH_APP_TOKEN: ${{ steps.gh-app-token.outputs.token }}
+          GH_FALLBACK_TOKEN: ${{ github.token }}
+        # This job's timeout leaves room for 10 minutes of backoff (gh_app_token.sh reads the
+        # cap from GH_BUDGET_WAIT_MAX_SECONDS).
+        run: |
+          if [ -f scripts/ci/gh_app_token.sh ]; then
+            bash scripts/ci/gh_app_token.sh --install
+            echo "GH_BUDGET_WAIT_MAX_SECONDS=600" >> "$GITHUB_ENV"
+          fi
+
       - name: Download delta results
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -3160,6 +3239,7 @@ jobs:
         id: republish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_APP_TOKEN: ${{ steps.gh-app-token.outputs.token }} # the uploader: App first, GH_TOKEN as fallback
         run: |
           set -euo pipefail
           current_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$CHANNEL_RELEASE_TAG" --jq .sha)"
