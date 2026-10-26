@@ -95,7 +95,8 @@ def backoff(attempt: int, error: RequestError | None = None) -> None:
         left = _rate_limit_deadline - now
     if left < 1:
         raise RuntimeError(f"GitHub rate limit did not reset within {RATE_LIMIT_BUDGET_SECONDS} s: {error}") from error
-    wait = min(max(error.wait if error.wait is not None else 60.0, 1.0), left)
+    # No Retry-After or reset header (a secondary limit): back off exponentially from 60 s.
+    wait = min(max(error.wait if error.wait is not None else 60.0 * 2 ** attempt, 1.0), left)
     print(f"GitHub rate limit ({error}); waiting {wait:.0f} s", file=sys.stderr, flush=True)
     _sleep(wait)
 
@@ -126,12 +127,17 @@ class Asset:
 
 class GitHub:
     def __init__(self, repo: str, token: str, *, api_url: str = "https://api.github.com",
-                 upload_url: str = "https://uploads.github.com"):
+                 upload_url: str = "https://uploads.github.com", fallback: str = ""):
         if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
             raise ValueError("Expected --repo owner/name")
         if not token or any(char in token for char in '\r\n"\\'):
             raise ValueError("GH_TOKEN must contain a valid token")
+        if any(char in fallback for char in '\r\n"\\'):
+            raise ValueError("GH_TOKEN must be a valid token")
         self.repo, self.token = repo, token
+        # With a fallback, token is the release App's: a refusal of it (401, 403, 429) switches
+        # to the fallback (github.token) for the rest of the run.
+        self.fallback = fallback if fallback != token else ""
         self.api_url, self.upload_url = api_url, upload_url
 
     def request(self, method: str, url: str, *, file: Path | None = None,
@@ -147,13 +153,21 @@ class GitHub:
         # rejected it unprocessed. Uploads reconcile in _upload_verified.
         single = bool(file) or method in {"POST", "PATCH"}
         attempts = 3
-        for attempt in range(attempts):
+        attempt = 0
+        while True:
             try:
                 return self._request(method, url, file=file, body=body, content_type=content_type)
             except RequestError as error:
+                # A refused request did nothing on GitHub's side, so it is safe to send again.
+                if self.fallback and error.status in (401, 403, 429):
+                    print(f"GitHub refused the release App token ({error}); using github.token from here on",
+                          file=sys.stderr, flush=True)
+                    self.token, self.fallback = self.fallback, ""
+                    continue
                 if (single and not error.rate_limited) or not error.retryable or attempt + 1 == attempts:
                     raise
                 backoff(attempt, error)
+                attempt += 1
 
     def _request(self, method: str, url: str, *, file: Path | None = None,
                  body: bytes | None = None, content_type: str | None = None):
@@ -504,7 +518,10 @@ def main() -> int:
     args = parser.parse_args()
     # Hash and validate every local file before any remote mutation.
     phases = plan(args.immutable, args.optional_immutable, args.alias, args.feed, replace_feeds=args.replace_feeds)
-    client = GitHub(args.repo, os.environ.get("GH_TOKEN", ""))
+    # GH_APP_TOKEN (the release App, a separate actor) first when the job minted one, GH_TOKEN
+    # (github.token) as its fallback.
+    app, token = os.environ.get("GH_APP_TOKEN", ""), os.environ.get("GH_TOKEN", "")
+    client = GitHub(args.repo, app or token, fallback=token if app else "")
     release_id = args.release_id if args.release_id is not None else client.release_id(args.tag)
     publish(client, release_id, phases)
     if args.github_output:
