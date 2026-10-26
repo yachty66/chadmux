@@ -29,6 +29,57 @@ const HANDLE_TAG: &str = "mux.handle";
 const CHILDREN_TAG: &str = "mux.children";
 const PARENT_TAG: &str = "mux.parent";
 
+/// Where each parent's children are: the sessions tagged with each `(mux.parent, mux.handle)`, kept
+/// as tags are written (`Hub::set_tags`) and as sessions are made (`Hub::make_session`: a load, a
+/// new chat, a fork, an import), and the peer row last found for each pair. A lookup reads one
+/// entry instead of every session; each entry is a hint that the lookup checks against the
+/// session's (or the row's) live tags again, so a stale one names nobody.
+#[derive(Default)]
+pub(crate) struct ChildTags(std::sync::Mutex<ChildIndex>);
+
+#[derive(Default)]
+struct ChildIndex {
+    /// Local sessions by `(mux.parent, mux.handle)`.
+    local: HashMap<(String, String), std::collections::BTreeSet<String>>,
+    /// Each indexed session's pair, to move it when its tags change.
+    pair_of: HashMap<String, (String, String)>,
+    /// The peer row (`remote_sessions` key) last found for a pair.
+    remote: HashMap<(String, String), String>,
+}
+
+impl ChildTags {
+    fn index(&self) -> std::sync::MutexGuard<'_, ChildIndex> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Indexes `session` under its `mux.parent` and `mux.handle` tags now (or takes it out).
+    /// Expiry is not judged here: the lookup checks the live tags.
+    pub(crate) fn note(&self, session: &Session) {
+        let pair = {
+            let meta = session.meta.lock().unwrap_or_else(|e| e.into_inner());
+            let raw = |key: &str| meta.tags.get(key).map(|t| t.value.clone());
+            raw(PARENT_TAG).zip(raw(HANDLE_TAG))
+        };
+        let mut index = self.index();
+        if let Some(old) = index.pair_of.remove(&session.id)
+            && let Some(ids) = index.local.get_mut(&old)
+        {
+            ids.remove(&session.id);
+            if ids.is_empty() {
+                index.local.remove(&old);
+            }
+        }
+        if let Some(pair) = pair {
+            index.local.entry(pair.clone()).or_default().insert(session.id.clone());
+            index.pair_of.insert(session.id.clone(), pair);
+        }
+    }
+
+    fn local(&self, pair: &(String, String)) -> Vec<String> {
+        self.index().local.get(pair).map(|ids| ids.iter().cloned().collect()).unwrap_or_default()
+    }
+}
+
 /// The longest preview, in characters, ellipsis included.
 const PREVIEW_CHARS: usize = 280;
 
@@ -168,23 +219,38 @@ impl Hub {
     /// The `mux.label` of the child of `parent` whose handle is `handle`: a
     /// session here, else one a peer lists (a cloud subagent), whose row
     /// carries its live tags.
+    /// Local sessions come from the index (`ChildTags`), never a walk over every session; a peer's
+    /// rows are walked only when the pair's last row no longer matches.
     fn child_label(&self, parent: &str, handle: &str) -> Option<String> {
-        let local = self.sessions().iter().find_map(|s| {
+        let pair = (parent.to_owned(), handle.to_owned());
+        let local = self.child_tags.local(&pair).into_iter().find_map(|id| {
+            let s = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()?;
             let meta = s.meta.lock().unwrap_or_else(|e| e.into_inner());
             let mine = live_tag(&meta, PARENT_TAG).as_deref() == Some(parent)
                 && live_tag(&meta, HANDLE_TAG).as_deref() == Some(handle);
             if mine { live_tag(&meta, LABEL_TAG) } else { None }
         });
-        local.or_else(|| {
-            let rows = self.remote_sessions.lock().unwrap_or_else(|e| e.into_inner());
-            rows.values().find_map(|r| {
-                let tags = r.summary.get("tags")?;
-                let tag = |key: &str| tags.get(key).and_then(text);
-                let mine = tag(PARENT_TAG).as_deref() == Some(parent)
-                    && tag(HANDLE_TAG).as_deref() == Some(handle);
-                if mine { tag(LABEL_TAG) } else { None }
-            })
-        })
+        local.or_else(|| self.peer_child_label(&pair))
+    }
+
+    /// `child_label` among the rows peers list (a cloud subagent), whose rows carry their live tags.
+    fn peer_child_label(&self, pair: &(String, String)) -> Option<String> {
+        let label = |r: &RemoteSession| {
+            let tags = r.summary.get("tags")?;
+            let tag = |key: &str| tags.get(key).and_then(text);
+            let mine = tag(PARENT_TAG).as_deref() == Some(pair.0.as_str())
+                && tag(HANDLE_TAG).as_deref() == Some(pair.1.as_str());
+            if mine { tag(LABEL_TAG) } else { None }
+        };
+        let last = self.child_tags.index().remote.get(pair).cloned();
+        let rows = self.remote_sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(found) = last.as_ref().and_then(|key| rows.get(key)).and_then(label) {
+            return Some(found);
+        }
+        let (key, found) = rows.iter().find_map(|(key, r)| Some((key.clone(), label(r)?)))?;
+        drop(rows);
+        self.child_tags.index().remote.insert(pair.clone(), key);
+        Some(found)
     }
 }
 
@@ -254,5 +320,43 @@ mod tests {
         );
         assert_eq!(hub.child_label("optchat-chief:h0me", "a12").as_deref(), Some("Nightly train"));
         assert_eq!(hub.child_label("optchat-chief:h0me", "a13"), None, "another Chief's child");
+        // Found again from the row it was found in, and again after that row moves away.
+        assert_eq!(hub.child_label("optchat-chief:h0me", "a12").as_deref(), Some("Nightly train"));
+        let generation = hub.peers.lock().unwrap()["cloud-vm"].generation;
+        hub.apply_peer_notice(
+            "cloud-vm",
+            generation,
+            PeerNotice::Sessions(vec![row(
+                "m3",
+                json!({"mux.parent": "optchat-chief:h0me", "mux.handle": "a12", "mux.label": "Moved"}),
+            )]),
+        );
+        assert_eq!(hub.child_label("optchat-chief:h0me", "a12").as_deref(), Some("Moved"));
+    }
+
+    /// #24337 review: a child is found through the index, which follows its tags (a session made
+    /// from a saved record, as a load makes it, then a tag change) and never names a session gone.
+    #[test]
+    fn the_child_index_follows_tags() {
+        let (hub, _dir) = hub_with_peer("cloud-vm", vec![]);
+        // A saved record with its tags, as a load reads it.
+        let meta = serde_json::from_value(json!({
+            "schema": crate::store::META_SCHEMA, "id": "kid", "name": "kid", "harness": "claude",
+            "cwd": "/tmp", "status": "idle", "createdAt": 0, "updatedAt": 0,
+            "tags": {"mux.parent": {"value": "optchat-chief:h0me"}, "mux.handle": {"value": "a12"},
+                     "mux.label": {"value": "Nightly train"}},
+        }))
+        .unwrap();
+        let kid = hub.make_session(meta);
+        hub.sessions.lock().unwrap().insert(kid.id.clone(), kid.clone());
+        assert_eq!(hub.child_label("optchat-chief:h0me", "a12").as_deref(), Some("Nightly train"));
+
+        let set: serde_json::Map<String, Value> = [("mux.handle".to_owned(), json!("a14"))].into_iter().collect();
+        hub.set_tags(&kid, Some(&set), &[], None);
+        assert_eq!(hub.child_label("optchat-chief:h0me", "a12"), None, "its old handle");
+        assert_eq!(hub.child_label("optchat-chief:h0me", "a14").as_deref(), Some("Nightly train"));
+
+        hub.sessions.lock().unwrap().remove(&kid.id);
+        assert_eq!(hub.child_label("optchat-chief:h0me", "a14"), None, "a session gone");
     }
 }

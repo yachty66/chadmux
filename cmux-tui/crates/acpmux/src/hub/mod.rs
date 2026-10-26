@@ -355,6 +355,8 @@ pub struct Hub {
     pub started_at: u64,
     pub(super) peers: StdMutex<HashMap<String, Arc<crate::peer::Peer>>>,
     pub(super) remote_sessions: StdMutex<HashMap<String, RemoteSession>>,
+    /// Each parent's children by tag, for an approval card's label (`permissions/display.rs`).
+    pub(super) child_tags: permissions::ChildTags,
     /// Leased peers by name, with the generation of the peer each lease
     /// started (`peer_lease.rs`); never saved. Lock order: this, then
     /// `peers`; never `peers` first.
@@ -516,6 +518,7 @@ impl Hub {
             started_at: now_ms(),
             peers: StdMutex::new(HashMap::new()),
             remote_sessions: StdMutex::new(HashMap::new()),
+            child_tags: Default::default(),
             peer_leases: StdMutex::new(HashMap::new()),
             peer_notices,
             peer_notices_rx: Mutex::new(Some(peer_notices_rx)),
@@ -779,7 +782,7 @@ impl Hub {
         let steering = meta.steering;
         // Until it starts, an adopted chat goes by the agent it last ran (its saved `agentInfo`).
         let backgrounds_work = crate::claude_stdio::steers_by_info(meta.agent_info.as_ref());
-        Arc::new(Session {
+        let session = Arc::new(Session {
             id: meta.id.clone(),
             seq: AtomicU64::new(meta.last_seq),
             meta: StdMutex::new(meta),
@@ -842,7 +845,10 @@ impl Hub {
             processes: StdMutex::new(Default::default()),
             pr_creates: StdMutex::new(Default::default()),
             composers: StdMutex::new(Default::default()),
-        })
+        });
+        // Found by its tags from now on (`permissions/display.rs`).
+        self.child_tags.note(&session);
+        session
     }
 
     // ------------------------------------------------------------ lookup
