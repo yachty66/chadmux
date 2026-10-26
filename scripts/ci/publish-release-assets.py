@@ -95,8 +95,7 @@ def backoff(attempt: int, error: RequestError | None = None) -> None:
         left = _rate_limit_deadline - now
     if left < 1:
         raise RuntimeError(f"GitHub rate limit did not reset within {RATE_LIMIT_BUDGET_SECONDS} s: {error}") from error
-    # No Retry-After or reset header (a secondary limit): back off exponentially from 60 s.
-    wait = min(max(error.wait if error.wait is not None else 60.0 * 2 ** attempt, 1.0), left)
+    wait = min(max(error.wait if error.wait is not None else 60.0, 1.0), left)
     print(f"GitHub rate limit ({error}); waiting {wait:.0f} s", file=sys.stderr, flush=True)
     _sleep(wait)
 

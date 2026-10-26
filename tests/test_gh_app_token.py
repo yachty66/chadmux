@@ -242,14 +242,6 @@ class PublisherTests(unittest.TestCase):
         text = (ROOT / "scripts/ci/publish-release-assets.py").read_text()
         self.assertIn('client = GitHub(args.repo, app or token, fallback=token if app else "")', text)
 
-    def test_a_secondary_limit_backs_off_exponentially(self) -> None:
-        waits = []
-        publisher._sleep = waits.append
-        publisher._rate_limit_deadline = None
-        for attempt in range(3):
-            publisher.backoff(attempt, publisher.RequestError("403", status=403, rate_limited=True))
-        self.assertEqual(waits, [60.0, 120.0, 240.0])
-
 
 # Publish jobs whose environment (release or release-next) holds CMUX_RELEASE_APP_ID/_KEY.
 APP_JOBS = {
