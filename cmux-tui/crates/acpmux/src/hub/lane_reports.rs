@@ -80,12 +80,16 @@ const HEAD: &str = "lane report: turn ";
 /// A report's prompt id starts with this.
 const PROMPT_PREFIX: &str = "lane-report-";
 
-static PULL_URL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+").unwrap() // crash-allow: constant pattern
+// Constant patterns; a report only loses its links if one ever failed to build.
+static PULL_URL: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+").ok()
 });
-static FULL_SHA: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[0-9a-f]{40}\b").unwrap() // crash-allow: constant pattern
-});
+static FULL_SHA: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"\b[0-9a-f]{40}\b").ok());
+
+/// Each match of `re` in `text`.
+fn matches(re: &Option<Regex>, text: &str) -> Vec<String> {
+    re.iter().flat_map(|re| re.find_iter(text)).map(|m| m.as_str().to_owned()).collect()
+}
 
 /// One lane's link to its parent.
 #[derive(Debug, Clone, Default)]
@@ -424,22 +428,17 @@ impl Hub {
         let now = now_ms();
         let due = self.lane_links(|links| {
             let l = links.get_mut(lane)?;
-            let report = due_report(l, now)?;
-            Some((l.parent.clone(), report))
+            let (report, key) = due_report(l, now)?;
+            Some((l.parent.clone(), report, key))
         });
-        let Some((parent, report)) = due else { return };
+        let Some((parent, report, key)) = due else { return };
         if let Err(e) = self.lane_deliver(&parent, lane, &report).await {
             tracing::warn!(lane, %parent, "lane report not delivered: {}", e.message);
             return;
         }
         self.lane_links(|links| {
             let Some(l) = links.get_mut(lane).filter(|l| l.parent == parent) else { return };
-            if l.ready.as_ref().is_some_and(|r| r.prompt_id == report.prompt_id) {
-                l.ready = None;
-            }
-            l.last = Some(report.key());
-            l.prs.extend(report.prs.iter().cloned());
-            l.sent.push(now);
+            delivered(l, &report, key, now);
         });
     }
 
@@ -463,9 +462,8 @@ impl Hub {
             .flatten()
             .filter_map(Value::as_str)
             .map(str::to_owned);
-        let named = PULL_URL.find_iter(&reply).map(|m| m.as_str().to_owned());
-        let prs = new_items(opened.chain(named), &[]);
-        let shas = new_items(FULL_SHA.find_iter(&reply).map(|m| m.as_str().to_owned()), &[]);
+        let prs = new_items(opened.chain(matches(&PULL_URL, &reply)), &[]);
+        let shas = new_items(matches(&FULL_SHA, &reply), &[]);
         let name = summary.get("name").and_then(Value::as_str).unwrap_or(&session.id);
         let state = state(&summary);
         Report {
@@ -591,9 +589,10 @@ fn last_turn_records(
     Ok(out)
 }
 
-/// `l`'s queued report to deliver now, without the pull requests reported before: none when it
-/// is the same as the last (dropped) or past the cap (held).
-fn due_report(l: &mut Link, now: u64) -> Option<Report> {
+/// `l`'s queued report to deliver now, without the pull requests reported before, and its key
+/// as queued (what `delivered` records as the last): none when it is the same as the last
+/// (dropped) or past the cap (held).
+fn due_report(l: &mut Link, now: u64) -> Option<(Report, String)> {
     l.sent.retain(|t| now.saturating_sub(*t) < WINDOW_MS);
     let ready = l.ready.as_ref()?;
     if l.last.as_deref() == Some(ready.key().as_str()) {
@@ -606,7 +605,18 @@ fn due_report(l: &mut Link, now: u64) -> Option<Report> {
     }
     let mut report = ready.clone();
     report.prs = new_items(report.prs, &l.prs);
-    Some(report)
+    Some((report, ready.key()))
+}
+
+/// Records on `l` that `report` (from `due_report`, queued with `key`) reached the parent at `now`.
+/// The last is the queued key, so a repeat still naming a reported pull request is dropped.
+fn delivered(l: &mut Link, report: &Report, key: String, now: u64) {
+    if l.ready.as_ref().is_some_and(|r| r.prompt_id == report.prompt_id) {
+        l.ready = None;
+    }
+    l.last = Some(key);
+    l.prs.extend(report.prs.iter().cloned());
+    l.sent.push(now);
 }
 
 /// A newer turn's report replaces one still queued, keeping the pull requests only that one
@@ -649,13 +659,31 @@ mod tests {
         let mut same = report(4, &[]);
         same.content = report(2, &[]).content;
         l.ready = Some(replace_ready(same, l.ready.take()));
-        let got = due_report(&mut l, later).unwrap();
+        let (got, _) = due_report(&mut l, later).unwrap();
         assert_eq!((got.turn, got.prs), (4, vec![x.to_owned()]));
         // The very same report is dropped.
         let mut l = Link { last: Some(report(2, &[]).key()), ..Link::default() };
         l.ready = Some(report(2, &[]));
         assert_eq!(due_report(&mut l, now), None);
         assert!(l.ready.is_none());
+    }
+
+    #[test]
+    fn a_repeated_report_naming_a_reported_pull_request_is_dropped() {
+        let (now, x) = (WINDOW_MS * 2, "https://github.com/o/r/pull/1");
+        let mut l = Link::default();
+        // Turn 2 names X; turn 3 says something new and still names X: both go.
+        for turn in [2, 3] {
+            l.ready = Some(report(turn, &[x]));
+            let (got, key) = due_report(&mut l, now).unwrap();
+            delivered(&mut l, &got, key, now);
+        }
+        // Turn 4 repeats turn 3 word for word: nothing new, so nothing goes.
+        let mut same = report(4, &[x]);
+        same.content = report(3, &[x]).content;
+        l.ready = Some(same);
+        assert_eq!(due_report(&mut l, now + 1), None);
+        assert_eq!(l.sent.len(), 2);
     }
 
     #[test]
