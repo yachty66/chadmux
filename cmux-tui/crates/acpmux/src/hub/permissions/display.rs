@@ -46,22 +46,34 @@ struct Spoken {
 const SPOKEN: &[Spoken] =
     &[Spoken { tool: "mcp__optchat__tell", action: "message", target: "id", text: "message" }];
 
-/// Drops every `_meta.acpmux.display` anywhere in `value`: what a peer daemon sends (its pending
-/// prompts, its event records, its replies) carries no display line of its own to this daemon's
-/// clients, since a peer on an older build passes on whatever its agent wrote there. Only this
-/// daemon's own stamp (`Hub::stamp_permission_display`) reaches a person; a peer's prompt shows
-/// its raw title, as before display lines.
+/// What a tool call or an ask carries of the agent's own: its input, output and content, and the
+/// ask's options. Whatever is inside them (a display-shaped field included) is the agent's data,
+/// shown and approved as it is.
+const AGENT_DATA: [&str; 4] = ["rawInput", "rawOutput", "content", "options"];
+
+/// Drops the display line (`toolCall._meta.acpmux.display`) of every permission request in
+/// `value`, wherever one sits: a pending prompt, an event record, the agent's own ask. What a peer
+/// daemon sends (its pending prompts, its event records, its replies) carries no display line of
+/// its own to this daemon's clients, since a peer on an older build passes on whatever its agent
+/// wrote there. Only this daemon's own stamp (`Hub::stamp_permission_display`) reaches a person;
+/// a peer's prompt shows its raw title, as before display lines. Nothing else changes: the
+/// agent's data (`AGENT_DATA`) is never looked into.
 pub(crate) fn drop_display_lines(value: &mut Value) {
     match value {
         Value::Object(map) => {
             if let Some(acpmux) = map
-                .get_mut("_meta")
-                .and_then(|m| m.get_mut("acpmux"))
+                .get_mut("toolCall")
+                .and_then(|call| call.get_mut("_meta"))
+                .and_then(|meta| meta.get_mut("acpmux"))
                 .and_then(Value::as_object_mut)
             {
                 acpmux.remove("display");
             }
-            map.values_mut().for_each(drop_display_lines);
+            for (key, child) in map.iter_mut() {
+                if !AGENT_DATA.contains(&key.as_str()) {
+                    drop_display_lines(child);
+                }
+            }
         }
         Value::Array(items) => items.iter_mut().for_each(drop_display_lines),
         _ => {}
@@ -69,6 +81,34 @@ pub(crate) fn drop_display_lines(value: &mut Value) {
 }
 
 impl Hub {
+    /// A logged record as a client reads it (`events_page`): an ask acpmux recorded carries the
+    /// display line worked out now, never one the log kept (an older build logged the agent's
+    /// words as they came), and the agent's own ask (`in`) carries none.
+    pub(in crate::hub) fn display_logged(
+        &self,
+        session: Option<&Session>,
+        record: &mut crate::store::EventRecord,
+    ) {
+        match record.dir.as_str() {
+            "mux" if matches!(record.kind.as_str(), "permission_request" | "permission_reissued") => {
+                if let Some(request) = record.msg.get_mut("request") {
+                    match session {
+                        Some(session) => self.stamp_permission_display(session, request),
+                        None => drop_display_lines(request),
+                    }
+                }
+            }
+            "in" if record.msg.get("method").and_then(Value::as_str)
+                == Some(crate::rpc::method::SESSION_REQUEST_PERMISSION) =>
+            {
+                if let Some(params) = record.msg.get_mut("params") {
+                    drop_display_lines(params);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Stamps the request's `_meta.acpmux.display` when its tool reads as a
     /// sentence (see the module docs). A display the request came with (the
     /// agent's own words) is dropped first, from every request: only acpmux
