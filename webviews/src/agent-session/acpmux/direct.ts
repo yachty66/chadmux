@@ -76,6 +76,7 @@ import { pasteRanges } from "./conversation/promptCollapse";
 import { AskTracker, pendingReader, SIDE_SESSION_METHOD } from "./needsYou/asks";
 import { chatTools, toolApplied, type ToolApplied } from "./summary/chatTools";
 import { taskGoal } from "./goal";
+import { PresenceClient } from "./multiplayer/presenceClient";
 import { recordedConversationEvents } from "./conversation/exportEvents";
 
 export type AcpmuxHostConfig = {
@@ -1208,6 +1209,12 @@ export class AcpmuxDirectClient {
     (method, params) => this.request(method, params, 15000),
     () => this.emit(),
   );
+  /// Who else is in a shared chat and who types there (multiplayer/presenceClient.ts). Nothing
+  /// crosses while acpmux sends no `presence` on attach.
+  readonly presence = new PresenceClient(
+    (method, params) => void this.request(method, params, 15000).catch(() => undefined),
+    () => this.emit(),
+  );
   readonly permissions = new PermissionGroupClient(
     (method, params) => this.request(method, params, 15000),
     () => {
@@ -1808,6 +1815,11 @@ export class AcpmuxDirectClient {
       return;
     }
     const notification = message as Notification;
+    // Who else is in the chat, ephemeral (multiplayer/presenceClient.ts): never a record.
+    if (notification.method === "_acpmux/presence") {
+      this.presence.notification(notification.params);
+      return;
+    }
     if (notification.method === "_acpmux/event") {
       // A chat started from an offer here, watched for its row (offer/offerChildren.ts).
       const params = notification.params ?? {};
@@ -2411,6 +2423,7 @@ export class AcpmuxDirectClient {
     const result = await attaching;
     this.syncView();
     if (generation !== this.selectionGeneration || this.selectedSessionId !== sessionId) return [];
+    this.presence.attached(sessionId, result);
     const page = records(result?.events);
     const oldest = page.length > 0 ? Math.min(...page.map((event) => event.seq)) : 0;
     // The chat ran on past what one page holds while the reader was away, so the kept tail and
@@ -3774,6 +3787,7 @@ export class AcpmuxDirectClient {
       peerKinds: this.peerKinds,
       peerConnected: this.peerConnected,
       ...(this.forkedAtSeq !== undefined ? { forkedAtSeq: this.forkedAtSeq } : {}),
+      ...(this.presence.presenceOf(this.selectedSessionId) ? { presence: this.presence.presenceOf(this.selectedSessionId) } : {}),
       summary: summary
         ? {
             sessionId: summary.sessionId,
@@ -3924,6 +3938,11 @@ export class AcpmuxDirectClient {
   /// 2026-10-20), so no send carries `_meta.acpmux.interrupt`. No send carries
   /// `_meta.acpmux.resend` either: the host refuses a page frame that does, and marks a resend
   /// itself (#22881, AgentPanePromptRelay.swift).
+  /// The composer's text changed (`chat.typing`): acpmux hears only that this pane types.
+  typing(text: string): void {
+    this.presence.typed(text);
+  }
+
   async send(
     input: string,
     attachments: ComposerAttachment[] = [],
@@ -3932,6 +3951,7 @@ export class AcpmuxDirectClient {
     ticket?: string,
     steer = false,
   ): Promise<string | undefined> {
+    this.presence.stopTyping();
     this.untakenSends += 1;
     let untaken = true;
     const settle = () => {
@@ -5683,6 +5703,7 @@ export class AcpmuxDirectClient {
   }
   /// The socket's own onclose ignores a socket close() already let go of, so settle requests here.
   close(): void {
+    this.presence.detached();
     // Before anything is torn down: the chat on screen is still readable here, and a tab closing on
     // it should leave it warm for the next one. The host alone keeps it: this client is going away,
     // and a tail left in this page's map would be drawn by whatever client comes after it.

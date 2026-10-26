@@ -223,6 +223,8 @@ type Props = {
   /// A new chat's typed text, before it has a session (acpmux keeps a session's draft): the host
   /// keeps it with the tab, so a relaunch opens the chat with it (cx-z5vd).
   onUnsentDraft?(text: string): void;
+  /// The text of a chat that has a session changed: the pane tells acpmux it types (multiplayer).
+  onTyping?(text: string): void;
   /// Where the host keeps the chat's unsent chips, so they come back when the chat shows again.
   keptAttachments?: KeptAttachments;
   /// Reads a transcript chosen by the cmux-owned `/import` command.
@@ -312,6 +314,7 @@ export function Composer({
   onEdit,
   onCmuxCommand,
   onUnsentDraft,
+  onTyping,
   keptAttachments,
   onImportFile,
   searchFiles,
@@ -733,6 +736,13 @@ export function Composer({
   useEffect(() => {
     unsentDraft.current?.push(text);
   }, [text, sessionId, onUnsentDraft]);
+  // Only a change the person makes: a chat's restored draft is not typing.
+  const typedFrom = useRef<{ sessionId?: string; text: string }>({ text: "" });
+  useEffect(() => {
+    const last = typedFrom.current;
+    typedFrom.current = { sessionId, text };
+    if (sessionId && last.sessionId === sessionId && last.text !== text) onTyping?.(text);
+  }, [text, sessionId, onTyping]);
   const commands = snapshot.commands;
   const remote = remoteComposer(snapshot);
   // Permission modes live in the access chip beside +; the + menu keeps only the Plan/Build toggle.

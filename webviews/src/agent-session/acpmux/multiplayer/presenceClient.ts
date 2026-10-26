@@ -36,6 +36,11 @@ export class PresenceClient {
     return this.current.viewing.length > 0 || this.current.typing.length > 0 ? this.current : undefined;
   }
 
+  /// The presence to draw for `sessionId` (the shown chat), so a switch never shows the last chat's.
+  presenceOf(sessionId: string | undefined): ChatPresence | undefined {
+    return sessionId !== undefined && sessionId === this.sessionId ? this.presence : undefined;
+  }
+
   /// A chat opened (its attach reply): presence when acpmux sends it, else none.
   attached(sessionId: string, reply: unknown): void {
     this.stopTyping();
