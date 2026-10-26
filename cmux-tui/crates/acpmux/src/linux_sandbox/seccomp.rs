@@ -277,8 +277,8 @@ pub(crate) fn filter(notify: bool) -> Result<Vec<libc::sock_filter>, String> {
     asm.mark(socketpair_not);
 
     if notify {
-        // E1: write opens. E2 adds mkdir/mknod/symlink; F adds the
-        // rename/unlink/chmod/chown/time/xattr tables here, after all denies.
+        // E1: write opens. F adds every name/metadata mutation after all
+        // deny rules, so link/linkat remain D1's unconditional EPERM.
         for (nr, argument) in [
             (libc::SYS_openat, SECCOMP_DATA_ARG2_LO),
             #[cfg(target_arch = "x86_64")]
@@ -305,6 +305,53 @@ pub(crate) fn filter(notify: bool) -> Result<Vec<libc::sock_filter>, String> {
             asm.jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_creat as u32, 0, 1);
             asm.stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_USER_NOTIF);
         }
+        let notify_mutation = asm.label();
+        let mutation_numbers: &[u32] = &[
+            libc::SYS_renameat as u32,
+            libc::SYS_renameat2 as u32,
+            libc::SYS_unlinkat as u32,
+            libc::SYS_truncate as u32,
+            libc::SYS_fchmodat as u32,
+            452, // fchmodat2
+            libc::SYS_fchownat as u32,
+            libc::SYS_utimensat as u32,
+            libc::SYS_setxattr as u32,
+            libc::SYS_lsetxattr as u32,
+            libc::SYS_removexattr as u32,
+            libc::SYS_lremovexattr as u32,
+            463, // setxattrat
+            466, // removexattrat
+            libc::SYS_fchmod as u32,
+            libc::SYS_fchown as u32,
+            libc::SYS_fsetxattr as u32,
+            libc::SYS_fremovexattr as u32,
+            libc::SYS_ftruncate as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_rename as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_unlink as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_rmdir as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_chmod as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_chown as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_lchown as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_utime as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_utimes as u32,
+            #[cfg(target_arch = "x86_64")]
+            libc::SYS_futimesat as u32,
+        ];
+        for number in mutation_numbers {
+            let next = asm.label();
+            asm.cond(BPF_JMP | BPF_JEQ | BPF_K, *number, notify_mutation, next);
+            asm.mark(next);
+        }
+        asm.mark(notify_mutation);
+        asm.stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_USER_NOTIF);
     }
 
     // Fallthrough for every syscall not handled above is the default allow.
