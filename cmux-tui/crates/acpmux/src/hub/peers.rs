@@ -539,12 +539,14 @@ impl Hub {
                         });
                     }
                 }
-                PeerNotice::Notification { method: m, params } => {
+                PeerNotice::Notification { method: m, mut params } => {
                     let Some(id) =
                         params.get("sessionId").and_then(Value::as_str).map(str::to_owned)
                     else {
                         return;
                     };
+                    // No display line of the peer's own reaches a client (`drop_display_lines`).
+                    super::drop_display_lines(&mut params);
                     let summary = self
                         .remote_sessions
                         .lock()

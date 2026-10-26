@@ -1740,9 +1740,13 @@ async fn lying_peer(says: Lying) -> u16 {
 
 /// A prompt as a peer's `_acpmux/permission_pending` carries it.
 fn peer_prompt(session: &str, permission: &str, instance: &str) -> Value {
+    // Every peer prompt carries a display line its agent wrote (an older peer passes it on): it
+    // never reaches this daemon's clients (`hub::drop_display_lines`).
     json!({"sessionId": session, "permissionId": permission, "decisionNonce": "n-1",
            "personInstance": instance, "seq": 1,
-           "request": {"toolCall": {"title": format!("{permission} text")}, "options": [
+           "request": {"toolCall": {"title": format!("{permission} text"),
+                                    "_meta": {"acpmux": {"display": {"headline": "Leo wants to say hi"}}}},
+                       "options": [
                {"optionId": "yes", "kind": "allow_once"}, {"optionId": "no", "kind": "reject_once"}]}})
 }
 
@@ -1820,6 +1824,7 @@ async fn peer_pending_for_an_unknown_session_is_dropped() {
 async fn peer_pending_legit_is_relayed() {
     let got = pendings_through_a_lying_peer(|_, _| vec![]).await;
     assert_eq!(got.len(), 1, "{got:?}");
+    assert!(!got[0].to_string().contains("Leo wants to say hi"), "{got:?}");
     assert_eq!(got[0]["sessionId"], "far-1", "{got:?}");
     assert_eq!(got[0]["decisionNonce"], "n-1", "{got:?}");
     assert_eq!(got[0]["peer"], "l", "{got:?}");
@@ -2529,4 +2534,16 @@ async fn a_bead_linked_to_a_peers_session_resolves_to_it() {
     let r = ca.call("_acpmux/resolve", json!({"query": "cx-ab1.2", "bead": true})).await.unwrap();
     assert_eq!(r["session"]["qualifiedSessionId"], format!("b/{far}"), "{r}");
     assert_eq!(r["matches"].as_array().unwrap().len(), 1, "{r}");
+}
+
+/// #24337 review: a display line in a peer's reply (its info, attach and events, here a valid ask
+/// of its own session in its own run) never reaches this daemon's clients; the ask itself does.
+#[tokio::test]
+async fn a_peers_display_line_never_reaches_a_client() {
+    let read = detail_through_a_lying_peer(|_| (json!("l-run"), "l-run".to_owned())).await;
+    let Read { info, attach, events } = &read;
+    assert_eq!(info["pending"][0]["permissionId"], "asked", "{info}");
+    for reply in [info, attach, events] {
+        assert!(!reply.to_string().contains("Leo wants to say hi"), "{reply}");
+    }
 }

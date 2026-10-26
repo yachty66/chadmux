@@ -286,6 +286,8 @@ async fn forward_inner(
         {
             obj.insert("presence".into(), crate::hub::presence::none(&id));
         }
+        // No display line of the peer's own reaches a client (`hub::drop_display_lines`).
+        crate::hub::drop_display_lines(&mut result);
         if m == method::SESSION_FORK
             && let Some(new_id) = result.get("sessionId").and_then(Value::as_str)
         {
