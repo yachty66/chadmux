@@ -3787,7 +3787,9 @@ export class AcpmuxDirectClient {
       peerKinds: this.peerKinds,
       peerConnected: this.peerConnected,
       ...(this.forkedAtSeq !== undefined ? { forkedAtSeq: this.forkedAtSeq } : {}),
-      ...(this.presence.presenceOf(this.selectedSessionId) ? { presence: this.presence.presenceOf(this.selectedSessionId) } : {}),
+      ...(this.presence.presenceOf(this.selectedSessionId)
+        ? { presence: this.presence.presenceOf(this.selectedSessionId) }
+        : {}),
       summary: summary
         ? {
             sessionId: summary.sessionId,

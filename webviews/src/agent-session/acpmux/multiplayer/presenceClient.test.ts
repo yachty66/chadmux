@@ -60,10 +60,14 @@ test("typing is on once, refreshed before acpmux's expiry, and off on send or em
   expect(sent.filter((s) => !s.on).length).toBe(2);
 });
 
-test("no keystroke for the idle time turns typing off", async () => {
-  const { presence, sent } = client();
-  presence.attached("s1", { presence: { sessionId: "s1", participants: [] } });
-  presence.typed("x");
-  await new Promise((resolve) => setTimeout(resolve, TYPING_IDLE_MS + 50));
-  expect(sent.at(-1)).toEqual({ sessionId: "s1", on: false });
-}, TYPING_IDLE_MS + 2_000);
+test(
+  "no keystroke for the idle time turns typing off",
+  async () => {
+    const { presence, sent } = client();
+    presence.attached("s1", { presence: { sessionId: "s1", participants: [] } });
+    presence.typed("x");
+    await new Promise((resolve) => setTimeout(resolve, TYPING_IDLE_MS + 50));
+    expect(sent.at(-1)).toEqual({ sessionId: "s1", on: false });
+  },
+  TYPING_IDLE_MS + 2_000,
+);
