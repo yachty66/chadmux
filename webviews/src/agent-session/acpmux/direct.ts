@@ -1244,7 +1244,7 @@ export class AcpmuxDirectClient {
   /// typing redraws no transcript.
   readonly presence = new PresenceClient(
     (method, params) => this.request(method, params, 15000),
-    () => shownPresence.set(this.presence.presence),
+    () => shownPresence.set(this.presence.chat, this.presence.presence),
   );
   readonly permissions = new PermissionGroupClient(
     (method, params) => this.request(method, params, 15000),
@@ -4008,8 +4008,8 @@ export class AcpmuxDirectClient {
   /// `_meta.acpmux.resend` either: the host refuses a page frame that does, and marks a resend
   /// itself (#22881, AgentPanePromptRelay.swift).
   /// The composer's text changed (`chat.typing`): acpmux hears only that this pane types.
-  typing(text: string): void {
-    this.presence.typed(text);
+  typing(text: string, sessionId?: string): void {
+    this.presence.typed(text, sessionId);
   }
 
   async send(

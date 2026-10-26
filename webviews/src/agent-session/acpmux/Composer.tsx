@@ -96,6 +96,9 @@ const STOP_GUARD_MS = 600;
 const UNSENT_DRAFT_INTERVAL_MS = 300;
 /// A field change this soon after the person's key, text input or composition is their edit.
 const TYPED_WINDOW_MS = 250;
+/// With Cmd or Ctrl held, the keys that edit the prompt (undo, redo, cut, delete a word or line);
+/// any other chord (select all, copy, a shortcut) changes nothing the person typed.
+const CHORD_EDIT_KEYS = new Set(["z", "y", "x", "Backspace", "Delete"]);
 /// Keys that move, leave or modify, never edit: a change after one is not typing.
 const NOT_AN_EDIT_KEY = new Set([
   "ArrowUp",
@@ -246,7 +249,7 @@ type Props = {
   onUnsentDraft?(text: string): void;
   /// The person edited the prompt of a chat that has a session: the pane tells acpmux it types
   /// (multiplayer). A draft coming back is not an edit.
-  onTyping?(text: string): void;
+  onTyping?(text: string, sessionId?: string): void;
   /// Where the host keeps the chat's unsent chips, so they come back when the chat shows again.
   keptAttachments?: KeptAttachments;
   /// Reads a transcript chosen by the cmux-owned `/import` command.
@@ -454,6 +457,11 @@ export function Composer({
   /// When the person last pressed an editing key, input text or composed: a field change soon
   /// after is theirs (typing), any other is applied from outside.
   const typedAt = useRef(Number.NEGATIVE_INFINITY);
+  /// A value applied from outside (a draft, another chat's prompt, a restore, a send's clear): the
+  /// key before it, if it changed nothing itself, does not make the applied change typing.
+  const notTyped = () => {
+    typedAt.current = Number.NEGATIVE_INFINITY;
+  };
   const prompts = usePromptHistory(snapshot.rows);
   // Send becomes Stop in place once the turn starts; a second click of a
   // double-click, or a click right after Enter, must not cancel the new turn.
@@ -585,7 +593,7 @@ export function Composer({
     () => ({
       restore(restoredText, restoredAttachments) {
         // Put back, not typed: the Enter that sent it says nothing about this change.
-        typedAt.current = Number.NEGATIVE_INFINITY;
+        notTyped();
         // What comes back goes first; what was typed or attached since stays after it.
         const typed = field.current?.value() ?? "";
         const next = typed.trim() ? `${restoredText}\n\n${typed}` : restoredText;
@@ -651,6 +659,7 @@ export function Composer({
   useEffect(() => {
     // The prompt's DOM value is the typed text; a draft never replaces it.
     if (!draft || field.current?.value()) return;
+    notTyped();
     field.current?.reset(draft);
     setText((current) => seededText(current, draft));
     setCaret(draft.length);
@@ -666,6 +675,8 @@ export function Composer({
     const previous = persistedSession.current;
     if (previous && hydratedSession.current === previous) writePersistedDraft(previous, field.current?.value() ?? text);
     persistedSession.current = sessionId;
+    // Another chat's prompt comes in: no key before it was typing for this one.
+    notTyped();
     hydratedSession.current = undefined;
     restoringSession.current = true;
     const restored = readPersistedDraft(sessionId) ?? "";
@@ -714,6 +725,7 @@ export function Composer({
       const currentText = field.current?.value() ?? textRef.current;
       if (!hasPendingWrite && restored && !currentText) {
         restoringSession.current = true;
+        notTyped();
         setText(restored);
         setCaret(restored.length);
         pendingCaret.current = restored.length;
@@ -846,7 +858,7 @@ export function Composer({
     setCaret(at);
     setDismissed(undefined);
     // Emptied (a command run, a prompt sent, the text deleted): this pane no longer types.
-    if (!value.trim() && sessionId) onTyping?.("");
+    if (!value.trim() && sessionId) onTyping?.("", sessionId);
   };
   const pick = (command: SlashCommand) => {
     const next = applyCommand(text, caret, command);
@@ -951,7 +963,7 @@ export function Composer({
     }
     const fromSend = document.activeElement?.classList.contains("acpmux-send") ?? false;
     // The key that sent it is spent: what the composer writes back after the send is not typing.
-    typedAt.current = Number.NEGATIVE_INFINITY;
+    notTyped();
     unsentDraft.current?.flush();
     const sent = attachments;
     const taken = onSend(prompt, sent, steer);
@@ -1309,11 +1321,17 @@ export function Composer({
     if (performance.now() - typedAt.current >= TYPED_WINDOW_MS) return;
     // One change per key: what the field does after it (normalizing) is not another.
     typedAt.current = Number.NEGATIVE_INFINITY;
-    if (sessionId && value.trim()) onTyping?.(value);
+    if (sessionId && value.trim()) onTyping?.(value, sessionId);
   };
   promptCaret.current = setCaret;
   promptKeyDown.current = (event) => {
-    if (!NOT_AN_EDIT_KEY.has(event.key)) typedAt.current = performance.now();
+    const chord = event.metaKey || event.ctrlKey;
+    if (
+      chord
+        ? CHORD_EDIT_KEYS.has(event.key.length === 1 ? event.key.toLowerCase() : event.key)
+        : !NOT_AN_EDIT_KEY.has(event.key)
+    )
+      typedAt.current = performance.now();
     return keyDown(event);
   };
   promptReturnInput.current = returnInput;

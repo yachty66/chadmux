@@ -702,7 +702,8 @@ const editQueued = (promptId: string, edit: QueueEdit) =>
 const reportTabRowTools = (width: number) => void callNative("pane.tabRowTools", { width }).catch(() => undefined);
 /// Hands the host a new chat's typed text, kept with its tab across a relaunch (cx-z5vd).
 /// The composer's text changed: the chat tells acpmux this pane types (never the text itself).
-const postTyping = (text: string) => void window.cmuxAcpmuxActions?.["chat.typing"]?.({ text }).catch(() => undefined);
+const postTyping = (text: string, sessionId?: string) =>
+  void window.cmuxAcpmuxActions?.["chat.typing"]?.({ text, sessionId }).catch(() => undefined);
 const postUnsentDraft = (text: string) => void callNative("chat.unsentDraft", { text }).catch(() => undefined);
 /// Each chat's unsent chips, kept by the host so reopening or restoring the chat brings them back
 /// (AgentPaneDraftAttachments.swift). A host without the store (the gallery, an older app) keeps none.
@@ -7115,7 +7116,8 @@ function AcpmuxPane() {
               steer === true,
             ),
           "chat.cancel": () => client.cancel(),
-          "chat.typing": async ({ text }) => client.typing(typeof text === "string" ? text : ""),
+          "chat.typing": async ({ text, sessionId }) =>
+            client.typing(typeof text === "string" ? text : "", typeof sessionId === "string" ? sessionId : undefined),
           "chat.queue.remove": ({ promptId }) => client.removeQueued(String(promptId)),
           "chat.agentPair.resume": ({ peer }) => client.resumeAgentPair(String(peer)),
           "chat.queue.edit": ({ promptId, ...edit }) => client.editQueued(String(promptId), edit as QueueEdit),
@@ -9499,7 +9501,10 @@ function AcpmuxPane() {
                     {!inTabRow && environmentSurface.header && environmentLine(environmentSurface.compact)}
                   </ChatHeaderStatus>
                   <div className="acpmux-handoff-header-tools" ref={tabRowTools}>
-                    <LivePresenceStack fallback={snapshot.presence} />
+                    <LivePresenceStack
+                      sessionId={snapshot.sessionId ?? snapshot.summary?.sessionId}
+                      fallback={snapshot.presence}
+                    />
                     {inTabRow && (
                       <ChatHeaderInlineStatus status={header.status} detail={header.detail}>
                         {environmentSurface.header && environmentLine(environmentSurface.compact)}
@@ -9712,7 +9717,10 @@ function AcpmuxPane() {
                   </div>
                 )}
                 {hostErrorCard}
-                <LiveTypingLine fallback={snapshot.presence} />
+                <LiveTypingLine
+                  sessionId={snapshot.sessionId ?? snapshot.summary?.sessionId}
+                  fallback={snapshot.presence}
+                />
                 {composer}
               </div>
             </>

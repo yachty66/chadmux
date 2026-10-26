@@ -177,3 +177,17 @@ test(
   },
   STOP_RETRY_MS * 4 + 2_000,
 );
+
+test("a keystroke in the chat still shown while the next one attaches says nothing to the next one", () => {
+  const { presence, sent } = client();
+  presence.attached("s1", { presence: { sessionId: "s1", participants: [me] } });
+  presence.detached();
+  // The switch's attach landed for s2, but the pane still shows s1 (its snapshots held).
+  presence.attached("s2", { presence: { sessionId: "s2", participants: [me] } });
+  presence.typed("for s1", "s1");
+  expect(sent).toEqual([]);
+  expect(presence.chat).toBe("s2");
+  // s2 shows: its own composer's keystrokes go to it.
+  presence.typed("for s2", "s2");
+  expect(sent).toEqual([{ sessionId: "s2", on: true }]);
+});

@@ -53,6 +53,12 @@ export class PresenceClient {
     return this.current.viewing.length > 0 || this.current.typing.length > 0 ? this.current : undefined;
   }
 
+  /// The chat this presence is for: the one attached, which a switch's attach makes the next chat
+  /// before the pane shows it.
+  get chat(): string | undefined {
+    return this.sessionId;
+  }
+
   /// The presence to draw for `sessionId` (the shown chat), so a switch never shows the last chat's.
   presenceOf(sessionId: string | undefined): ChatPresence | undefined {
     return sessionId !== undefined && sessionId === this.sessionId ? this.presence : undefined;
@@ -76,10 +82,13 @@ export class PresenceClient {
     this.set(chatPresence(params, this.self));
   }
 
-  /// The composer's text changed: typing while it holds text, stopped when it is empty.
-  typed(text: string): void {
+  /// The composer's text changed: typing while it holds text, stopped when it is empty. `shown` is
+  /// the chat whose composer it is: a keystroke in the chat still on screen while the next one's
+  /// attach lands says nothing to the next one.
+  typed(text: string, shown?: string): void {
     if (!this.supported || !this.sessionId) return;
     if (!text.trim()) return this.stopTyping();
+    if (shown !== undefined && shown !== this.sessionId) return;
     const now = this.now();
     if (!this.typingOn || now - this.sentAt >= TYPING_REFRESH_MS) {
       this.typingOn = true;

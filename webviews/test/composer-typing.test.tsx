@@ -87,6 +87,9 @@ function Chips() {
   return null;
 }
 
+/// The chat each report named: the composer's own, never the next chat's during a switch.
+const typedIn: Array<string | undefined> = [];
+
 async function render(sessionId: string, typed: string[], handle = createRef<ComposerHandle>()) {
   const { createRoot } = await import("react-dom/client");
   const { Composer } = await import("../src/agent-session/acpmux/Composer");
@@ -105,7 +108,10 @@ async function render(sessionId: string, typed: string[], handle = createRef<Com
         onStop={() => {}}
         onProject={() => {}}
         onNewChat={() => {}}
-        onTyping={(text) => typed.push(text)}
+        onTyping={(text, id) => {
+          typed.push(text);
+          typedIn.push(id);
+        }}
         handle={handle}
         localName="studio"
         projectChoices={[{ cwd: "/Users/you/src/app", label: "app" }]}
@@ -193,4 +199,76 @@ test("a failed prompt put back is not typing, and a send's clear says it stopped
   await until(() => prompt() === "ship it", "the restored prompt");
   await settle();
   expect(typed).toEqual([]);
+});
+
+const editor = () => host.querySelector<HTMLElement>('[role="combobox"]')!;
+const key = (init: KeyboardEventInit) =>
+  act(async () => void editor().dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, ...init })));
+/// A browser edit the field hears as a change (jsdom edits nothing on a key: the field's `type`
+/// stands in for the text the key put there).
+const browserEdit = (text: string) => act(async () => void markdownField().type(text));
+
+test("each input path is typing, for the composer's own chat: a key, a paste, an input method", async () => {
+  typedIn.length = 0;
+  const typed: string[] = [];
+  await render("typing-paths", typed);
+  // A key that edits (Backspace, which the browser applies).
+  await key({ key: "Backspace" });
+  await browserEdit("draft");
+  await until(() => typed.at(-1) === "draft", "the key's edit");
+  // A paste.
+  await act(async () => markdownField().setCaret(Number.MAX_SAFE_INTEGER));
+  await act(async () => markdownField().pasteText(" pasted"));
+  await until(() => typed.at(-1) === "draft pasted", "the paste");
+  // An input method's composition.
+  await act(
+    async () => void editor().dispatchEvent(new dom.window.CompositionEvent("compositionstart", { bubbles: true })),
+  );
+  await browserEdit("draft pasted 日本");
+  await until(() => typed.at(-1) === "draft pasted 日本", "the composition");
+  expect(new Set(typedIn)).toEqual(new Set(["typing-paths"]));
+});
+
+test("whitespace alone is not typing", async () => {
+  const typed: string[] = [];
+  await render("typing-blank", typed);
+  await act(async () => markdownField().insertTyped("   "));
+  await settle();
+  expect(typed.filter((text) => text !== "")).toEqual([]);
+});
+
+test("a key that changes nothing, then another chat's draft, is not typing", async () => {
+  writePersistedDraft("typing-next", "kept for next ");
+  const typed: string[] = [];
+  await render("typing-first", typed);
+  // Select all: a chord that edits nothing, so a change after it is not the person's.
+  await key({ key: "a", metaKey: true });
+  await browserEdit("not typed");
+  await settle();
+  expect(typed).toEqual([]);
+  // Backspace on an empty prompt edits nothing either; the switch's draft right after is not typing.
+  await act(async () => markdownField().reset(""));
+  await key({ key: "Backspace" });
+  await render("typing-next", typed);
+  await until(() => prompt().startsWith("kept for next"), "the next chat's draft");
+  await settle();
+  await settle();
+  expect(typed.filter((text) => text !== "")).toEqual([]);
+});
+
+test("a key that changes nothing, then the daemon's draft for this chat, is not typing", async () => {
+  let answer: (draft: { draft: string }) => void = () => {};
+  page().cmuxAcpmuxActions = { "chat.readDraft": () => new Promise((resolve) => (answer = resolve)) };
+  try {
+    const typed: string[] = [];
+    await render("typing-late", typed);
+    await key({ key: "Backspace" });
+    await act(async () => answer({ draft: "came back late " }));
+    await until(() => prompt().startsWith("came back late"), "the daemon's draft");
+    await settle();
+    await settle();
+    expect(typed.filter((text) => text !== "")).toEqual([]);
+  } finally {
+    delete page().cmuxAcpmuxActions;
+  }
 });

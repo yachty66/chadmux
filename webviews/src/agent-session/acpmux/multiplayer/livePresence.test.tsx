@@ -6,19 +6,22 @@ import { JSDOM } from "jsdom";
 
 const dom = new JSDOM("<!doctype html>", { url: "http://localhost/" });
 const scope = globalThis as Record<string, unknown>;
-const saved = {
-  window: "window" in scope,
-  document: "document" in scope,
-  values: { window: scope.window, document: scope.document },
-};
+const keys = ["window", "document", "navigator", "HTMLElement", "Node", "Element"] as const;
+const saved = keys.map((key) => [key, key in scope, scope[key]] as const);
 
 beforeAll(() => {
-  scope.window = dom.window;
-  scope.document = dom.window.document;
+  Object.assign(scope, {
+    window: dom.window,
+    document: dom.window.document,
+    navigator: dom.window.navigator,
+    HTMLElement: dom.window.HTMLElement,
+    Node: dom.window.Node,
+    Element: dom.window.Element,
+  });
 });
 afterAll(() => {
-  for (const key of ["window", "document"] as const)
-    if (saved[key]) scope[key] = saved.values[key];
+  for (const [key, had, value] of saved)
+    if (had) scope[key] = value;
     else delete scope[key];
 });
 
@@ -76,8 +79,8 @@ test("a teammate's presence reaches the live faces without a pane snapshot", asy
       params: { sessionId: mockHost.sessionId, participants: [owner, { ...ana, typing: true }] },
     });
     await settle(() => changes.length > 0);
-    expect(shownPresence.get()?.viewing.map((p) => p.id)).toEqual([ana.id]);
-    expect(shownPresence.get()?.typing.map((p) => p.id)).toEqual([ana.id]);
+    expect(shownPresence.get()?.presence?.viewing.map((p) => p.id)).toEqual([ana.id]);
+    expect(shownPresence.get()?.presence?.typing.map((p) => p.id)).toEqual([ana.id]);
     // Ana stops typing: the faces change again, and still no snapshot.
     hooks!.deliver({
       jsonrpc: "2.0",
@@ -85,7 +88,7 @@ test("a teammate's presence reaches the live faces without a pane snapshot", asy
       params: { sessionId: mockHost.sessionId, participants: [owner, ana] },
     });
     await settle(() => changes.length > 1);
-    expect(shownPresence.get()?.typing).toEqual([]);
+    expect(shownPresence.get()?.presence?.typing).toEqual([]);
     expect(snapshots).toBe(before);
     stop();
   } finally {
@@ -93,4 +96,40 @@ test("a teammate's presence reaches the live faces without a pane snapshot", asy
   }
   // Closed: nobody shows.
   expect(shownPresence.get()).toBeUndefined();
+});
+
+test("the faces and typing line draw only over the chat the presence is for", async () => {
+  const { createRoot } = await import("react-dom/client");
+  const { act } = await import("react");
+  const { LivePresenceStack, LiveTypingLine, shownPresence } = await import("./LivePresence");
+  const scopeAct = scope as { IS_REACT_ACT_ENVIRONMENT?: boolean };
+  scopeAct.IS_REACT_ACT_ENVIRONMENT = true;
+  const host = dom.window.document.createElement("div");
+  dom.window.document.body.append(host);
+  const root = createRoot(host);
+  const presence = { viewing: [ana], typing: [ana] };
+  const draw = (sessionId: string) =>
+    act(async () =>
+      root.render(
+        <>
+          <LivePresenceStack sessionId={sessionId} />
+          <LiveTypingLine sessionId={sessionId} />
+        </>,
+      ),
+    );
+  try {
+    // The next chat attached while the pane still shows the one before: nothing of it draws there.
+    await act(async () => shownPresence.set("s2", presence));
+    await draw("s1");
+    expect(host.querySelector(".cv-presence")).toBeNull();
+    expect(host.textContent).toBe("");
+    await draw("s2");
+    expect(host.querySelector(".cv-presence")).not.toBeNull();
+    expect(host.textContent).toContain("Ana");
+  } finally {
+    await act(async () => root.unmount());
+    await act(async () => shownPresence.set(undefined, undefined));
+    host.remove();
+    delete scopeAct.IS_REACT_ACT_ENVIRONMENT;
+  }
 });
