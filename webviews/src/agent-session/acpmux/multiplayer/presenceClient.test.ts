@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { PresenceClient, TYPING_IDLE_MS, TYPING_REFRESH_MS } from "./presenceClient";
+import { PresenceClient, STOP_RETRIES, STOP_RETRY_MS, TYPING_IDLE_MS, TYPING_REFRESH_MS } from "./presenceClient";
 
 const ana = { id: "tailnet:ana@example.com", name: "Ana", devices: 1, viewing: true, typing: false };
 const me = { id: "owner", name: "Leo", devices: 1, viewing: true, typing: false };
@@ -9,7 +9,9 @@ function client() {
   let changes = 0;
   let clock = 1_000;
   const presence = new PresenceClient(
-    (_method, params) => sent.push(params),
+    (_method, params) => {
+      sent.push(params);
+    },
     () => (changes += 1),
     () => "owner",
     () => clock,
@@ -84,3 +86,94 @@ test("a teammate's pane leaves out the id its attach reply names, and shows the 
   presence.attached("s2", { presence: { sessionId: "s2", participants: [me, ana] } });
   expect(presence.presenceOf("s2")?.viewing.map((p) => p.id)).toEqual([ana.id]);
 });
+
+test("a notification after an attach without presence shows nobody and turns no typing on", () => {
+  const { presence, sent } = client();
+  presence.attached("s1", { events: [] });
+  presence.notification({ sessionId: "s1", participants: [me, { ...ana, typing: true }] });
+  expect(presence.presenceOf("s1")).toBeUndefined();
+  presence.typed("hello");
+  expect(sent).toEqual([]);
+});
+
+test("a detached pane's keystrokes reach no chat until the next attach", () => {
+  const { presence, sent } = client();
+  presence.attached("s1", { presence: { sessionId: "s1", participants: [me] } });
+  presence.typed("h");
+  // A switch: the chat before hears the off at once, then nothing while the next attach is pending.
+  presence.detached(true);
+  expect(sent).toEqual([
+    { sessionId: "s1", on: true },
+    { sessionId: "s1", on: false },
+  ]);
+  presence.typed("he");
+  expect(sent.length).toBe(2);
+  expect(presence.presenceOf("s1")).toBeUndefined();
+  // The attach fails: still nothing. It lands for s2: typing goes to s2.
+  presence.typed("hel");
+  expect(sent.length).toBe(2);
+  presence.attached("s2", { presence: { sessionId: "s2", participants: [me] } });
+  presence.typed("hell");
+  expect(sent.at(-1)).toEqual({ sessionId: "s2", on: true });
+  presence.detached();
+});
+
+const refused = () => Promise.reject(Object.assign(new Error("slow down"), { reason: "typing.rate_limited" }));
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test(
+  "an off refused for the rate goes again, a bounded number of times",
+  async () => {
+    const sent: { sessionId: string; on: boolean }[] = [];
+    const presence = new PresenceClient(
+      (_method, params) => {
+        sent.push(params);
+        return params.on ? Promise.resolve({}) : refused();
+      },
+      () => {},
+    );
+    presence.attached("s1", { presence: { sessionId: "s1", participants: [me] } });
+    presence.typed("h");
+    presence.stopTyping();
+    await wait(STOP_RETRY_MS * (STOP_RETRIES + 1) + 200);
+    expect(sent.filter((s) => !s.on).length).toBe(STOP_RETRIES + 1);
+  },
+  STOP_RETRY_MS * (STOP_RETRIES + 2) + 2_000,
+);
+
+test(
+  "a refused off that lands on retry stops, and typing again cancels a pending retry",
+  async () => {
+    const sent: { sessionId: string; on: boolean }[] = [];
+    let refusals = 1;
+    const presence = new PresenceClient(
+      (_method, params) => {
+        sent.push(params);
+        if (!params.on && refusals > 0) {
+          refusals -= 1;
+          return refused();
+        }
+        return Promise.resolve({});
+      },
+      () => {},
+    );
+    presence.attached("s1", { presence: { sessionId: "s1", participants: [me] } });
+    presence.typed("h");
+    presence.stopTyping();
+    await wait(STOP_RETRY_MS + 200);
+    expect(sent.filter((s) => !s.on).length).toBe(2);
+    await wait(STOP_RETRY_MS + 200);
+    expect(sent.filter((s) => !s.on).length).toBe(2);
+    // Refused again, then typing starts before the retry: no stale off follows the on.
+    refusals = 1;
+    presence.typed("again");
+    presence.stopTyping();
+    await wait(0);
+    presence.typed("again and again");
+    await wait(STOP_RETRY_MS + 200);
+    expect(sent.at(-1)).toEqual({ sessionId: "s1", on: true });
+    presence.detached();
+    await wait(0);
+  },
+  STOP_RETRY_MS * 4 + 2_000,
+);

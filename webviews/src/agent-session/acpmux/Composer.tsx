@@ -224,7 +224,8 @@ type Props = {
   /// A new chat's typed text, before it has a session (acpmux keeps a session's draft): the host
   /// keeps it with the tab, so a relaunch opens the chat with it (cx-z5vd).
   onUnsentDraft?(text: string): void;
-  /// The text of a chat that has a session changed: the pane tells acpmux it types (multiplayer).
+  /// The person edited the prompt of a chat that has a session: the pane tells acpmux it types
+  /// (multiplayer). A draft coming back is not an edit.
   onTyping?(text: string): void;
   /// Where the host keeps the chat's unsent chips, so they come back when the chat shows again.
   keptAttachments?: KeptAttachments;
@@ -741,13 +742,6 @@ export function Composer({
   useEffect(() => {
     unsentDraft.current?.push(text);
   }, [text, sessionId, onUnsentDraft]);
-  // Only a change the person makes: a chat's restored draft is not typing.
-  const typedFrom = useRef<{ sessionId?: string; text: string }>({ text: "" });
-  useEffect(() => {
-    const last = typedFrom.current;
-    typedFrom.current = { sessionId, text };
-    if (sessionId && last.sessionId === sessionId && last.text !== text) onTyping?.(text);
-  }, [text, sessionId, onTyping]);
   const commands = snapshot.commands;
   const remote = remoteComposer(snapshot);
   // Permission modes live in the access chip beside +; the + menu keeps only the Plan/Build toggle.
@@ -1277,7 +1271,12 @@ export function Composer({
     enterShell(data.slice(1));
     return true;
   };
-  promptChange.current = edit;
+  // Only the person's own edit is typing (the field reports no value applied from outside): a
+  // chat's draft coming back, on open or on a switch, is not.
+  promptChange.current = (value, at) => {
+    edit(value, at);
+    if (sessionId) onTyping?.(value);
+  };
   promptCaret.current = setCaret;
   promptKeyDown.current = keyDown;
   promptReturnInput.current = returnInput;

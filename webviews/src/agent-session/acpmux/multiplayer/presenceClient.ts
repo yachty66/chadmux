@@ -5,7 +5,12 @@
 // clear or 5 s without a keystroke. Only on/off crosses, never the draft. An acpmux that answered
 // no `presence` on attach has neither method, so this pane then sends nothing.
 //
-// One timer, the idle one: armed on a keystroke, cleared on off, on a chat switch and on close.
+// acpmux takes at most two typing calls a second from a connection (`typing.rate_limited`): a
+// refused off is sent again, at most STOP_RETRIES times, so others never see this pane typing
+// until acpmux's expiry; a refused on is sent again with the next keystroke.
+//
+// Two timers: the idle one, armed on a keystroke and cleared on off, on a chat switch and on close;
+// and a refused off's retry, cleared when it lands, gives up, or typing starts again.
 import { chatPresence, type ChatPresence } from "./participants";
 
 /// acpmux drops an `on` after 8 s; a pane still typing says so again before that.
@@ -13,7 +18,13 @@ export const TYPING_REFRESH_MS = 5_000;
 /// No keystroke for this long and the pane says it stopped.
 export const TYPING_IDLE_MS = 5_000;
 
-type Send = (method: "_acpmux/typing", params: { sessionId: string; on: boolean }) => void;
+/// A refused off goes again this long after, at most STOP_RETRIES times.
+export const STOP_RETRY_MS = 600;
+export const STOP_RETRIES = 3;
+
+type Send = (method: "_acpmux/typing", params: { sessionId: string; on: boolean }) => Promise<unknown> | void;
+
+const rateLimited = (error: unknown) => (error as { reason?: unknown } | null)?.reason === "typing.rate_limited";
 
 export class PresenceClient {
   private sessionId: string | undefined;
@@ -25,6 +36,7 @@ export class PresenceClient {
   private typingOn = false;
   private sentAt = 0;
   private idle: ReturnType<typeof setTimeout> | undefined;
+  private stopRetry: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private readonly send: Send,
@@ -56,11 +68,11 @@ export class PresenceClient {
     this.set(this.supported ? chatPresence(presence, this.self) : { viewing: [], typing: [] });
   }
 
-  /// `_acpmux/presence` for any chat; only the open chat's counts.
+  /// `_acpmux/presence` for any chat; only the open chat's counts, and only when its attach reply
+  /// said acpmux serves presence.
   notification(params: unknown): void {
     const sessionId = (params as { sessionId?: unknown } | undefined)?.sessionId;
-    if (sessionId !== this.sessionId) return;
-    this.supported = true;
+    if (!this.supported || sessionId !== this.sessionId) return;
     this.set(chatPresence(params, this.self));
   }
 
@@ -72,7 +84,12 @@ export class PresenceClient {
     if (!this.typingOn || now - this.sentAt >= TYPING_REFRESH_MS) {
       this.typingOn = true;
       this.sentAt = now;
-      this.send("_acpmux/typing", { sessionId: this.sessionId, on: true });
+      this.cancelStopRetry();
+      const sessionId = this.sessionId;
+      void Promise.resolve(this.send("_acpmux/typing", { sessionId, on: true })).catch((error) => {
+        // Refused: the next keystroke says it again.
+        if (rateLimited(error) && this.sessionId === sessionId && this.sentAt === now) this.sentAt = -Infinity;
+      });
     }
     if (this.idle) clearTimeout(this.idle);
     this.idle = setTimeout(() => this.stopTyping(), TYPING_IDLE_MS);
@@ -84,15 +101,34 @@ export class PresenceClient {
     this.idle = undefined;
     if (!this.typingOn) return;
     this.typingOn = false;
-    if (this.sessionId) this.send("_acpmux/typing", { sessionId: this.sessionId, on: false });
+    if (this.sessionId) this.sendStop(this.sessionId, 0);
   }
 
-  /// The pane leaves the chat (a switch or close).
-  detached(): void {
+  /// Off for `sessionId`; refused for the rate, again later, until typing starts there again.
+  private sendStop(sessionId: string, tries: number): void {
+    this.cancelStopRetry();
+    void Promise.resolve(this.send("_acpmux/typing", { sessionId, on: false })).catch((error) => {
+      if (!rateLimited(error) || tries >= STOP_RETRIES || this.stopRetry !== undefined) return;
+      if (this.typingOn && this.sessionId === sessionId) return;
+      this.stopRetry = setTimeout(() => {
+        this.stopRetry = undefined;
+        if (!(this.typingOn && this.sessionId === sessionId)) this.sendStop(sessionId, tries + 1);
+      }, STOP_RETRY_MS);
+    });
+  }
+
+  private cancelStopRetry(): void {
+    if (this.stopRetry) clearTimeout(this.stopRetry);
+    this.stopRetry = undefined;
+  }
+
+  /// The pane leaves the chat (a switch or close). `quiet`: the caller draws the change itself.
+  detached(quiet = false): void {
     this.stopTyping();
     this.sessionId = undefined;
     this.supported = false;
-    this.set({ viewing: [], typing: [] });
+    if (quiet) this.current = { viewing: [], typing: [] };
+    else this.set({ viewing: [], typing: [] });
   }
 
   private set(next: ChatPresence): void {

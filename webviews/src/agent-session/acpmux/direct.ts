@@ -1227,7 +1227,7 @@ export class AcpmuxDirectClient {
   /// Who else is in a shared chat and who types there (multiplayer/presenceClient.ts). Nothing
   /// crosses while acpmux sends no `presence` on attach.
   readonly presence = new PresenceClient(
-    (method, params) => void this.request(method, params, 15000).catch(() => undefined),
+    (method, params) => this.request(method, params, 15000),
     () => this.emit(),
   );
   readonly permissions = new PermissionGroupClient(
@@ -1647,6 +1647,9 @@ export class AcpmuxDirectClient {
 
   /** Drops everything that belongs to the previously selected session, before another one attaches. */
   private resetSessionState(): void {
+    // Typing and presence stop with the chat at once, not when the next attach lands: a keystroke
+    // meanwhile never reaches the chat before. The caller draws the change.
+    this.presence.detached(true);
     // The chats started from the chat before are no longer watched.
     this.offerChildren.reset(this.socket?.readyState === WebSocket.OPEN);
     clearTimeout(this.stopTimer);
