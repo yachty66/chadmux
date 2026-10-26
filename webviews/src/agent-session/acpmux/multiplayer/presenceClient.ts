@@ -17,6 +17,9 @@ type Send = (method: "_acpmux/typing", params: { sessionId: string; on: boolean 
 
 export class PresenceClient {
   private sessionId: string | undefined;
+  /// This pane's own id in the open chat: the attach reply's `you.id` (a teammate the host daemon
+  /// admitted), else the one the pane was made with.
+  private self: string;
   private supported = false;
   private current: ChatPresence = { viewing: [], typing: [] };
   private typingOn = false;
@@ -29,7 +32,9 @@ export class PresenceClient {
     /// This pane's author id: a local pane sends none, which acpmux names `owner`.
     private readonly me: () => string = () => "owner",
     private readonly now: () => number = Date.now,
-  ) {}
+  ) {
+    this.self = me();
+  }
 
   /// The open chat's presence, or undefined when nobody else is here.
   get presence(): ChatPresence | undefined {
@@ -45,9 +50,10 @@ export class PresenceClient {
   attached(sessionId: string, reply: unknown): void {
     this.stopTyping();
     this.sessionId = sessionId;
-    const presence = (reply as { presence?: unknown } | undefined)?.presence;
+    const { presence, you } = (reply ?? {}) as { presence?: unknown; you?: { id?: unknown } };
+    this.self = typeof you?.id === "string" && you.id ? you.id : this.me();
     this.supported = presence !== undefined;
-    this.set(this.supported ? chatPresence(presence, this.me()) : { viewing: [], typing: [] });
+    this.set(this.supported ? chatPresence(presence, this.self) : { viewing: [], typing: [] });
   }
 
   /// `_acpmux/presence` for any chat; only the open chat's counts.
@@ -55,7 +61,7 @@ export class PresenceClient {
     const sessionId = (params as { sessionId?: unknown } | undefined)?.sessionId;
     if (sessionId !== this.sessionId) return;
     this.supported = true;
-    this.set(chatPresence(params, this.me()));
+    this.set(chatPresence(params, this.self));
   }
 
   /// The composer's text changed: typing while it holds text, stopped when it is empty.

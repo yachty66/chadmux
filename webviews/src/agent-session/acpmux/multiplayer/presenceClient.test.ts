@@ -71,3 +71,16 @@ test(
   },
   TYPING_IDLE_MS + 2_000,
 );
+
+// A teammate's pane (through the host daemon) is not acpmux's `owner`: the attach reply names its
+// own id, so it sees the owner and not itself.
+test("a teammate's pane leaves out the id its attach reply names, and shows the owner", () => {
+  const { presence } = client();
+  presence.attached("s1", { you: { id: ana.id }, presence: { sessionId: "s1", participants: [me, ana] } });
+  expect(presence.presenceOf("s1")?.viewing.map((p) => p.id)).toEqual(["owner"]);
+  presence.notification({ sessionId: "s1", participants: [me, { ...ana, typing: true }] });
+  expect(presence.presenceOf("s1")?.typing).toEqual([]);
+  // The next chat without `you` is the pane's own again.
+  presence.attached("s2", { presence: { sessionId: "s2", participants: [me, ana] } });
+  expect(presence.presenceOf("s2")?.viewing.map((p) => p.id)).toEqual([ana.id]);
+});
