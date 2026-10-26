@@ -926,6 +926,19 @@ mod notification_tests {
         static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = Fixture::new();
+        if case >= 4 {
+            fs::write(fixture.0.join(".git/hooks/pre-commit.sample"), b"protected").unwrap();
+            fs::write(fixture.0.join("CLAUDE.md"), b"instructions").unwrap();
+            fs::write(fixture.0.join("ordinary"), b"ordinary").unwrap();
+            fs::set_permissions(fixture.0.join("ordinary"), fs::Permissions::from_mode(0o600))
+                .unwrap();
+            if case == 4 || case == 8 {
+                fs::remove_dir_all(fixture.0.join(".git")).unwrap();
+                if case == 8 {
+                    fs::create_dir(fixture.0.join(".git")).unwrap();
+                }
+            }
+        }
         let mut paths = paths.to_vec();
         paths.push(
             CString::new(fixture.0.join(".git/config").as_os_str().as_encoded_bytes()).unwrap(),
@@ -1100,6 +1113,9 @@ mod notification_tests {
             if case == 3 {
                 return race();
             }
+            if case >= 4 {
+                return mutation_case(case);
+            }
             for (i, path) in paths.iter().enumerate() {
                 let fd = open(path.as_ptr(), O_CREAT | O_WRONLY | O_TRUNC, 0o666);
                 if fd >= 0 {
@@ -1214,6 +1230,129 @@ mod notification_tests {
         if let Some((fixture, status)) = exercise(2, &[]) {
             assert_eq!(status, 0);
             assert!(!fixture.0.join("gone").exists());
+        }
+    }
+
+    /// Each case runs a finite syscall sequence; the harness's child alarm
+    /// bounds any blocking operation. No allocations or unwinding after fork.
+    unsafe fn mutation_case(case: u8) -> i32 {
+        unsafe {
+            let at = AT_FDCWD;
+            let hook = c".git/hooks/pre-commit.sample".as_ptr();
+            let ordinary = c"ordinary".as_ptr();
+            let times = [timespec { tv_sec: 123, tv_nsec: 456 }; 2];
+            if case == 16 {
+                if renameat(at, ordinary, at, c"renamed".as_ptr()) != 0 {
+                    return 110;
+                }
+                if fchmodat(at, c"renamed".as_ptr(), 0o640, 0) != 0 {
+                    return 111;
+                }
+                if utimensat(at, c"renamed".as_ptr(), times.as_ptr(), 0) != 0 {
+                    return 112;
+                }
+                let fd = open(c"renamed".as_ptr(), O_RDONLY | O_CLOEXEC);
+                let mut metadata: libc::stat = std::mem::zeroed();
+                if fd < 0 || fstat(fd, &mut metadata) != 0 {
+                    return 119;
+                }
+                close(fd);
+                if metadata.st_mode & 0o777 != 0o640
+                    || metadata.st_mtime != 123
+                    || metadata.st_mtime_nsec != 456
+                {
+                    return 120;
+                }
+                if unlinkat(at, c"renamed".as_ptr(), 0) != 0 {
+                    return 113;
+                }
+                return 0;
+            }
+            let rc = match case {
+                4 => renameat(at, c"a".as_ptr(), at, c".git".as_ptr()) as c_long,
+                5 => renameat(at, ordinary, at, c".git/hooks/new".as_ptr()) as c_long,
+                6 => renameat(at, c".git".as_ptr(), at, c"moved-git".as_ptr()) as c_long,
+                7 => syscall(SYS_renameat2, at, ordinary, at, hook, RENAME_EXCHANGE),
+                8 => unlinkat(at, c".git".as_ptr(), AT_REMOVEDIR) as c_long,
+                9 => unlinkat(at, c"CLAUDE.md".as_ptr(), 0) as c_long,
+                10 => fchmodat(at, hook, 0o755, 0) as c_long,
+                11 | 12 => {
+                    let fd = open(hook, O_RDONLY | O_CLOEXEC);
+                    if fd < 0 {
+                        return 114;
+                    }
+                    let result = if case == 11 { fchmod(fd, 0o755) } else { ftruncate(fd, 0) };
+                    let saved = *__errno_location();
+                    close(fd);
+                    *__errno_location() = saved;
+                    result as c_long
+                }
+                13 => utimensat(at, c".git/config".as_ptr(), times.as_ptr(), 0) as c_long,
+                14 => setxattr(
+                    c"CLAUDE.md".as_ptr(),
+                    c"user.acpmux".as_ptr(),
+                    c"x".as_ptr().cast(),
+                    1,
+                    0,
+                ) as c_long,
+                15 => {
+                    syscall(SYS_renameat2, at, ordinary, at, c"whiteout".as_ptr(), RENAME_WHITEOUT)
+                }
+                _ => return 115,
+            };
+            let errno = *__errno_location();
+            if rc != -1 {
+                return 116;
+            }
+            if case == 15 {
+                return if errno == EPERM { 0 } else { 117 };
+            }
+            if matches!(errno, EACCES | EPERM) { 0 } else { 118 }
+        }
+    }
+
+    macro_rules! mutation_test {
+        ($name:ident, $case:literal) => {
+            #[test]
+            fn $name() {
+                if let Some((fixture, status)) = exercise($case, &[]) {
+                    assert_eq!(
+                        status, 0,
+                        "mutation child failed (116 = allowed; 118 = wrong errno)"
+                    );
+                    assert_eq!(fs::read(fixture.0.join("ordinary")).unwrap(), b"ordinary");
+                    assert_eq!(fs::read(fixture.0.join("CLAUDE.md")).unwrap(), b"instructions");
+                    if $case != 4 && $case != 8 {
+                        let hook = fixture.0.join(".git/hooks/pre-commit.sample");
+                        assert_eq!(fs::read(&hook).unwrap(), b"protected");
+                        assert_eq!(fs::metadata(hook).unwrap().permissions().mode() & 0o111, 0);
+                        assert_eq!(fs::read(fixture.0.join(".git/config")).unwrap(), b"protected");
+                    }
+                }
+            }
+        };
+    }
+
+    mutation_test!(mutation_rename_directory_to_git_denied, 4);
+    mutation_test!(mutation_rename_into_hooks_denied, 5);
+    mutation_test!(mutation_rename_git_away_denied, 6);
+    mutation_test!(mutation_exchange_hooks_denied, 7);
+    mutation_test!(mutation_remove_git_denied, 8);
+    mutation_test!(mutation_remove_instructions_denied, 9);
+    mutation_test!(mutation_chmod_hook_denied, 10);
+    mutation_test!(mutation_fchmod_readonly_hook_denied, 11);
+    mutation_test!(mutation_ftruncate_readonly_hook_denied, 12);
+    mutation_test!(mutation_utimensat_git_config_denied, 13);
+    mutation_test!(mutation_setxattr_instructions_denied, 14);
+    mutation_test!(mutation_whiteout_always_denied, 15);
+
+    #[test]
+    fn mutation_ordinary_cwd_changes_allowed() {
+        if let Some((fixture, status)) = exercise(16, &[]) {
+            assert_eq!(status, 0, "ordinary mutation failed");
+            assert!(!fixture.0.join("ordinary").exists());
+            assert!(!fixture.0.join("renamed").exists());
+            assert_eq!(fs::read(fixture.0.join("CLAUDE.md")).unwrap(), b"instructions");
         }
     }
 
