@@ -1090,6 +1090,8 @@ impl Hub {
             after: params.get("afterSeq").and_then(Value::as_u64).or(events.then_some(0)),
             has_more: result.get("hasMore") != Some(&Value::Bool(false)),
             host_last_seq: result.get("lastSeq").and_then(Value::as_u64),
+            // Only a peer that says how far its page holds is taken past the page's last record.
+            through: result.get("pageThrough").and_then(Value::as_u64),
             row: self.resolve_remote(&format!("{peer}/{mux}")).map(|(_, _, row)| row),
             records: records.clone(),
         };
