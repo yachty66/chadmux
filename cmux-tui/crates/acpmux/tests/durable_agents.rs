@@ -2002,6 +2002,11 @@ async fn an_adopted_prompt_gets_acpmuxs_own_display_line_again() {
                     e["msg"]["request"]["toolCall"]["_meta"]["acpmux"]["display"] = forged.clone();
                     e.to_string()
                 }
+                // The agent's own ask as the log keeps it, with the line it wrote.
+                Ok(mut e) if e["dir"] == "in" && e["msg"]["method"] == "session/request_permission" => {
+                    e["msg"]["params"]["toolCall"]["_meta"]["acpmux"]["display"] = forged.clone();
+                    e.to_string()
+                }
                 _ => line.to_owned(),
             })
             .collect();
@@ -2016,4 +2021,26 @@ async fn an_adopted_prompt_gets_acpmuxs_own_display_line_again() {
     assert_ne!(display["headline"], "Leo wants to say hi", "{display}");
     assert_eq!(display["target"], "a12", "{display}");
     assert_eq!(display["preview"], "run the nightly", "{display}");
+
+    // The chat's history as a client reads it (pages forward and back, attach, a transcript page):
+    // the logged ask carries acpmux's line, and nothing carries the logged one.
+    let mut rpc = daemon.rpc().await;
+    let reads = [
+        rpc.call("_acpmux/events", json!({"sessionId": session, "afterSeq": 0})).await,
+        rpc.call("_acpmux/events", json!({"sessionId": session, "beforeSeq": u64::MAX})).await,
+        rpc.call("_acpmux/attach", json!({"sessionId": session})).await,
+        rpc.call("_acpmux/attach", json!({"sessionId": session, "kinds": ["transcript"]})).await,
+    ];
+    for read in &reads {
+        assert!(!read.to_string().contains("Leo wants to say hi"), "{read:#}");
+        let logged = read["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "permission_request" && e["msg"]["permissionId"] == json!(pid))
+            .unwrap_or_else(|| panic!("no permission_request in {read:#}"));
+        let display = &logged["msg"]["request"]["toolCall"]["_meta"]["acpmux"]["display"];
+        assert_eq!(display["target"], "a12", "{display}");
+        assert_eq!(display["preview"], "run the nightly", "{display}");
+    }
 }

@@ -1741,10 +1741,12 @@ async fn lying_peer(says: Lying) -> u16 {
 /// A prompt as a peer's `_acpmux/permission_pending` carries it.
 fn peer_prompt(session: &str, permission: &str, instance: &str) -> Value {
     // Every peer prompt carries a display line its agent wrote (an older peer passes it on): it
-    // never reaches this daemon's clients (`hub::drop_display_lines`).
+    // never reaches this daemon's clients (`hub::drop_display_lines`). The tool's own input, a
+    // display-shaped field in it included, reaches them as the peer asks it.
     json!({"sessionId": session, "permissionId": permission, "decisionNonce": "n-1",
            "personInstance": instance, "seq": 1,
            "request": {"toolCall": {"title": format!("{permission} text"),
+                                    "rawInput": {"document": {"_meta": {"acpmux": {"display": {"headline": "the tool's own input"}}}}},
                                     "_meta": {"acpmux": {"display": {"headline": "Leo wants to say hi"}}}},
                        "options": [
                {"optionId": "yes", "kind": "allow_once"}, {"optionId": "no", "kind": "reject_once"}]}})
@@ -1825,6 +1827,7 @@ async fn peer_pending_legit_is_relayed() {
     let got = pendings_through_a_lying_peer(|_, _| vec![]).await;
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(!got[0].to_string().contains("Leo wants to say hi"), "{got:?}");
+    assert!(got[0].to_string().contains("the tool's own input"), "{got:?}");
     assert_eq!(got[0]["sessionId"], "far-1", "{got:?}");
     assert_eq!(got[0]["decisionNonce"], "n-1", "{got:?}");
     assert_eq!(got[0]["peer"], "l", "{got:?}");
@@ -2545,5 +2548,9 @@ async fn a_peers_display_line_never_reaches_a_client() {
     assert_eq!(info["pending"][0]["permissionId"], "asked", "{info}");
     for reply in [info, attach, events] {
         assert!(!reply.to_string().contains("Leo wants to say hi"), "{reply}");
+    }
+    // The tool's own input is the peer's, kept whole.
+    for reply in [info, events] {
+        assert!(reply.to_string().contains("the tool's own input"), "{reply}");
     }
 }
