@@ -305,53 +305,44 @@ pub(crate) fn filter(notify: bool) -> Result<Vec<libc::sock_filter>, String> {
             asm.jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_creat as u32, 0, 1);
             asm.stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_USER_NOTIF);
         }
-        let notify_mutation = asm.label();
-        let mutation_numbers: &[u32] = &[
-            libc::SYS_renameat as u32,
-            libc::SYS_renameat2 as u32,
-            libc::SYS_unlinkat as u32,
-            libc::SYS_truncate as u32,
-            libc::SYS_fchmodat as u32,
-            452, // fchmodat2
-            libc::SYS_fchownat as u32,
-            libc::SYS_utimensat as u32,
-            libc::SYS_setxattr as u32,
-            libc::SYS_lsetxattr as u32,
-            libc::SYS_removexattr as u32,
-            libc::SYS_lremovexattr as u32,
-            463, // setxattrat
-            466, // removexattrat
-            libc::SYS_fchmod as u32,
-            libc::SYS_fchown as u32,
-            libc::SYS_fsetxattr as u32,
-            libc::SYS_fremovexattr as u32,
-            libc::SYS_ftruncate as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_rename as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_unlink as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_rmdir as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_chmod as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_chown as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_lchown as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_utime as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_utimes as u32,
-            #[cfg(target_arch = "x86_64")]
-            libc::SYS_futimesat as u32,
+        #[allow(unused_mut)] // The legacy syscall extension exists only on x86_64.
+        let mut mutations = vec![
+            libc::SYS_renameat,
+            libc::SYS_renameat2,
+            libc::SYS_unlinkat,
+            libc::SYS_truncate,
+            libc::SYS_fchmodat,
+            452, /* fchmodat2 */
+            libc::SYS_fchownat,
+            libc::SYS_utimensat,
+            libc::SYS_setxattr,
+            libc::SYS_lsetxattr,
+            libc::SYS_removexattr,
+            libc::SYS_lremovexattr,
+            463,
+            466, /* setxattrat, removexattrat */
+            libc::SYS_fchmod,
+            libc::SYS_fchown,
+            libc::SYS_fsetxattr,
+            libc::SYS_fremovexattr,
+            libc::SYS_ftruncate,
         ];
-        for number in mutation_numbers {
-            let next = asm.label();
-            asm.cond(BPF_JMP | BPF_JEQ | BPF_K, *number, notify_mutation, next);
-            asm.mark(next);
+        #[cfg(target_arch = "x86_64")]
+        mutations.extend([
+            libc::SYS_rename,
+            libc::SYS_unlink,
+            libc::SYS_rmdir,
+            libc::SYS_chmod,
+            libc::SYS_chown,
+            libc::SYS_lchown,
+            libc::SYS_utime,
+            libc::SYS_utimes,
+            libc::SYS_futimesat,
+        ]);
+        for nr in mutations {
+            asm.jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1);
+            asm.stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_USER_NOTIF);
         }
-        asm.mark(notify_mutation);
-        asm.stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_USER_NOTIF);
     }
 
     // Fallthrough for every syscall not handled above is the default allow.

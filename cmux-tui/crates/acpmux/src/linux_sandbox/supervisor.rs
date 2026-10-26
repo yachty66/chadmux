@@ -1,5 +1,5 @@
-//! E1 write-open supervision; no production caller until G2.
-//! Activation also requires F: every mutation must hold the same process-wide
+//! Filesystem supervision; no production caller until G2.
+//! Activation still requires E2 creation calls to hold the same process-wide
 //! mutex and per-uid flock through resolve/check/perform, across all supervisors.
 //! Bwrap supplies read-only mounts and masks; this is not a standalone sandbox.
 //! Activation requires A2 to reject mounts under writable roots that are not
@@ -24,6 +24,7 @@ use std::{
 };
 
 mod locking;
+mod mutations;
 
 type Result<T> = std::result::Result<T, i32>;
 fn error() -> i32 {
@@ -260,6 +261,19 @@ fn resolve_inner(
         }
         let metadata = stat(pin.as_raw_fd())?;
         if metadata.st_mode & S_IFMT == S_IFLNK {
+            // Mutation operations address a directory entry without following it.
+            if queue.is_empty() && flags & (O_PATH | O_NOFOLLOW) == (O_PATH | O_NOFOLLOW) {
+                if directory_required {
+                    return Err(ENOTDIR);
+                }
+                return Ok(Resolved {
+                    parent: stack.pop().ok_or(EACCES)?,
+                    name,
+                    logical: target.to_str().ok_or(EACCES)?.into(),
+                    object: None,
+                    directory_required,
+                });
+            }
             if queue.is_empty() && flags & O_NOFOLLOW != 0 {
                 return Err(ELOOP);
             }
@@ -472,8 +486,18 @@ pub(crate) fn run(notify_fd: OwnedFd, policy: WritePolicy, stop: OwnedFd) -> io:
             Err(ECANCELED) => return Ok(()),
             Err(errno) => return Err(io::Error::from_raw_os_error(errno)),
         };
-        if let Err(errno) = emulate(fd, &request, &policy) {
-            let reply = seccomp_notif_resp { id: request.id, val: 0, error: -errno, flags: 0 };
+        let result = if arguments(&request.data).is_ok() {
+            emulate(fd, &request, &policy).map(|()| None)
+        } else {
+            mutations::emulate(fd, &request, &policy)
+        };
+        let (value, errno) = match result {
+            Ok(None) => continue,
+            Ok(Some(value)) => (value, 0),
+            Err(errno) => (0, errno),
+        };
+        {
+            let reply = seccomp_notif_resp { id: request.id, val: value, error: -errno, flags: 0 };
             unsafe {
                 response.as_mut_ptr().cast::<seccomp_notif_resp>().write(reply);
             }
@@ -919,11 +943,12 @@ mod notification_tests {
         }
     }
 
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Child lifetime is bounded by SIGALRM; every post-fork call is raw libc.
     /// Parent loops end at child exit/error; recv and supervisor joins have deadlines.
     fn exercise(case: u8, paths: &[CString]) -> Option<(Fixture, i32)> {
         // Serialize forks so another case cannot inherit and keep our listener alive.
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = Fixture::new();
         if case >= 4 {
@@ -1100,6 +1125,146 @@ mod notification_tests {
         }
     }
 
+    /// Two children have independent filters/listeners; all forks precede the
+    /// supervisor threads. Finite 1000-call loops and child alarms bound work.
+    #[test]
+    fn mutation_two_supervisors_cannot_create_through_a_renamed_parent() {
+        if exercise(1, &[]).is_none() {
+            return;
+        } // Existing kernel capability probes.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.0.join("cache")).unwrap();
+        let cwd = CString::new(fixture.0.as_os_str().as_encoded_bytes()).unwrap();
+        let program = seccomp::filter(true).unwrap();
+        let mut sockets = [[-1; 2]; 2];
+        let mut listeners: Vec<OwnedFd> = Vec::new();
+        let mut children = Vec::new();
+        unsafe {
+            for pair in &mut sockets {
+                assert_eq!(
+                    socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair.as_mut_ptr()),
+                    0
+                );
+            }
+            for (i, pair) in sockets.iter().enumerate() {
+                let pid = fork();
+                assert!(pid >= 0);
+                if pid == 0 {
+                    for listener in &listeners {
+                        close(listener.as_raw_fd());
+                    }
+                    for pair in sockets {
+                        for fd in pair {
+                            if fd != sockets[i][1] {
+                                close(fd);
+                            }
+                        }
+                    }
+                    let mut mask: sigset_t = std::mem::zeroed();
+                    sigemptyset(&mut mask);
+                    sigprocmask(SIG_SETMASK, &mask, std::ptr::null_mut());
+                    signal(SIGALRM, SIG_DFL);
+                    alarm(30);
+                    if chdir(cwd.as_ptr()) != 0 || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        _exit(90);
+                    }
+                    let prog = sock_fprog {
+                        len: program.len() as u16,
+                        filter: program.as_ptr().cast_mut(),
+                    };
+                    let fd = syscall(
+                        SYS_seccomp,
+                        SECCOMP_SET_MODE_FILTER,
+                        SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_TSYNC | (1 << 4),
+                        &prog,
+                    ) as i32;
+                    if fd < 0 || transfer(sockets[i][1], fd, true) < 0 {
+                        _exit(91);
+                    }
+                    close(fd);
+                    let mut ack = 0u8;
+                    if read(sockets[i][1], (&mut ack as *mut u8).cast(), 1) != 1 {
+                        _exit(92);
+                    }
+                    for _ in 0..1000 {
+                        if i == 0 {
+                            let fd = open(c"cache/config".as_ptr(), O_CREAT | O_WRONLY, 0o600);
+                            if fd < 0 {
+                                _exit(93);
+                            }
+                            close(fd);
+                        } else {
+                            let rc = renameat(
+                                AT_FDCWD,
+                                c"cache".as_ptr(),
+                                AT_FDCWD,
+                                c".git/hooks/cache".as_ptr(),
+                            );
+                            if rc != -1 || !matches!(*__errno_location(), EACCES | EPERM) {
+                                _exit(94);
+                            }
+                            let rc = renameat(
+                                AT_FDCWD,
+                                c".git/hooks/cache".as_ptr(),
+                                AT_FDCWD,
+                                c"cache".as_ptr(),
+                            );
+                            if rc != -1 {
+                                _exit(95);
+                            }
+                        }
+                    }
+                    _exit(0);
+                }
+                children.push(pid);
+                close(pair[1]);
+                let mut ready = pollfd { fd: pair[0], events: POLLIN, revents: 0 };
+                assert_eq!(poll(&mut ready, 1, 5000), 1);
+                let fd = transfer(pair[0], -1, false);
+                assert!(fd >= 0);
+                listeners.push(OwnedFd::from_raw_fd(fd));
+            }
+            let mut workers = Vec::new();
+            for (i, listener) in listeners.into_iter().enumerate() {
+                let stop = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                assert!(stop >= 0);
+                let stop = OwnedFd::from_raw_fd(stop);
+                let thread_stop = stop.try_clone().unwrap();
+                let policy = fixture.policy();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let thread = std::thread::spawn(move || {
+                    let _ = tx.send(run(listener, policy, thread_stop));
+                });
+                workers.push((stop, rx, thread));
+                assert_eq!(write(sockets[i][0], (&1u8 as *const u8).cast(), 1), 1);
+                close(sockets[i][0]);
+            }
+            let mut statuses = Vec::new();
+            for pid in children {
+                let mut status = 0;
+                while waitpid(pid, &mut status, 0) != pid {
+                    assert_eq!(error(), EINTR);
+                }
+                statuses.push(status);
+            }
+            for (stop, rx, thread) in workers {
+                let result = rx.recv_timeout(Duration::from_secs(3));
+                if result.is_err() {
+                    let _ = write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8);
+                }
+                thread.join().unwrap();
+                result.unwrap().unwrap();
+            }
+            assert!(
+                statuses.iter().all(|s| WIFEXITED(*s) && WEXITSTATUS(*s) == 0),
+                "children: {statuses:?}"
+            );
+        }
+        assert!(!fixture.0.join(".git/hooks/cache/config").exists());
+        assert!(fixture.0.join("cache/config").exists());
+    }
+
     /// Finite syscall cases; SIGALRM bounds blocking opens and the race worker.
     unsafe fn child_case(case: u8, paths: &[CString]) -> i32 {
         unsafe {
@@ -1270,6 +1435,7 @@ mod notification_tests {
             }
             let rc = match case {
                 4 => renameat(at, c"a".as_ptr(), at, c".git".as_ptr()) as c_long,
+                18 => renameat(at, c"a".as_ptr(), at, c".git/cache".as_ptr()) as c_long,
                 5 => renameat(at, ordinary, at, c".git/hooks/new".as_ptr()) as c_long,
                 6 => renameat(at, c".git".as_ptr(), at, c"moved-git".as_ptr()) as c_long,
                 7 => syscall(SYS_renameat2, at, ordinary, at, hook, RENAME_EXCHANGE),
@@ -1345,6 +1511,7 @@ mod notification_tests {
     mutation_test!(mutation_utimensat_git_config_denied, 13);
     mutation_test!(mutation_setxattr_instructions_denied, 14);
     mutation_test!(mutation_whiteout_always_denied, 15);
+    mutation_test!(mutation_directory_relocation_requires_subtree_checks, 18);
 
     #[test]
     fn mutation_ordinary_cwd_changes_allowed() {
