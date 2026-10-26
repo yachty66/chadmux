@@ -126,7 +126,8 @@ const settle = () =>
 
 const prompt = () => host.querySelector('[role="combobox"]')?.textContent ?? "";
 const markdownField = () => host.querySelector<MarkdownFieldElement>(".acpmux-md-field")!.acpmuxMarkdownField!;
-const page = () => dom.window as unknown as { cmuxAcpmuxActions?: Record<string, (params: unknown) => Promise<unknown>> };
+const page = () =>
+  dom.window as unknown as { cmuxAcpmuxActions?: Record<string, (params: unknown) => Promise<unknown>> };
 
 test("a draft read back from the daemon on open is not typing; an edit is", async () => {
   page().cmuxAcpmuxActions = { "chat.readDraft": async () => ({ draft: "half a thought" }) };
