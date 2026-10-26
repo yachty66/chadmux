@@ -77,6 +77,23 @@ if [ ! -s "$dir/token" ] || [ -z "$caller" ] ||
   exec "$REAL_GH" "$@"
 fi
 
+# The call's API area: `gh api repos/O/R/<area>/...` gives <area>, another subcommand its name
+# (`gh release ...` gives release). The release App holds Contents and Workflows write and
+# Variables read only, so an area it is refused ("Resource not accessible by integration", e.g.
+# actions or issues) goes straight to github.token for the rest of the job.
+area="${1:-}"
+if [ "$area" = api ]; then
+  for arg in "${@:2}"; do
+    case "$arg" in repos/* | /repos/*)
+      area="$(printf '%s' "${arg#/}" | sed -n 's#^repos/[^/]*/[^/]*/\([^/?]*\).*#\1#p')"
+      break ;;
+    esac
+  done
+fi
+if grep -qxF "$area" "$dir/unscoped" 2>/dev/null; then
+  exec "$REAL_GH" "$@"
+fi
+
 work="$(mktemp -d "${TMPDIR:-/tmp}/gh-app-token.XXXXXX")" || exec "$REAL_GH" "$@"
 trap 'rm -rf "$work"' EXIT
 
@@ -88,7 +105,7 @@ for arg in "$@"; do
 done
 [ -z "$stdin_file" ] || cat >"$stdin_file"
 
-refused(){ grep -qiE "$1" "$work/err" "$work/out"; }
+refused() { grep -qiE "$1" "$work/err" "$work/out"; }
 
 try=1
 while :; do
@@ -101,6 +118,9 @@ while :; do
     rc=$?
     if [ "$rc" -eq 0 ] || ! refused "$throttled|HTTP 40[13]|bad credentials"; then
       break
+    fi
+    if refused 'resource not accessible by integration'; then
+      echo "$area" >>"$dir/unscoped"
     fi
     if refused 'HTTP 401|bad credentials'; then
       rm -f "$dir/token"

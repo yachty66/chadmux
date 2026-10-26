@@ -128,6 +128,17 @@ class WrapperTests(unittest.TestCase):
             self.assertEqual(h.calls(), [f"{APP} api repos/o/r/actions/runs", f"{FALLBACK} api repos/o/r/actions/runs"])
             self.assertEqual(h.waited(), 0)
 
+    def test_an_area_the_app_cannot_reach_goes_to_github_token_for_the_job(self) -> None:
+        h = self.harness()
+        h.refuse(APP, 1, "HTTP 403: Resource not accessible by integration (https://api.github.com/x)")
+        self.assertEqual(h.gh("api", "repos/o/r/actions/runs/1/artifacts").returncode, 0)
+        self.assertEqual(h.gh("api", "--paginate", "/repos/o/r/actions/artifacts?name=x").returncode, 0)
+        self.assertEqual(h.gh("api", "repos/o/r/releases/tags/nightly").returncode, 0)
+        self.assertEqual(h.calls(), [f"{APP} api repos/o/r/actions/runs/1/artifacts",
+                                     f"{FALLBACK} api repos/o/r/actions/runs/1/artifacts",
+                                     f"{FALLBACK} api --paginate /repos/o/r/actions/artifacts?name=x",
+                                     f"{APP} api repos/o/r/releases/tags/nightly"])
+
     def test_an_expired_app_token_is_dropped_for_the_job(self) -> None:
         h = self.harness()
         h.refuse(APP, 1, "HTTP 401: Bad credentials (https://api.github.com/x)")
