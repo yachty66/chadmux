@@ -12,7 +12,8 @@ import React, {
   useState,
   useSyncExternalStore,
 } from "react";
-import { AnsweredBy, AuthorChip, PresenceStack, TypingLine } from "./multiplayer/Faces";
+import { AnsweredBy, AuthorChip } from "./multiplayer/Faces";
+import { LivePresenceStack, LiveTypingLine } from "./multiplayer/LivePresence";
 import { flushSync } from "react-dom";
 import { CONNECT_ACTIONS, savedEnvironmentHost, type ConnectKind, type OffloadKind } from "./environments";
 import { chiefEnvelope } from "./conversation/chiefEnvelope";
@@ -9498,7 +9499,7 @@ function AcpmuxPane() {
                     {!inTabRow && environmentSurface.header && environmentLine(environmentSurface.compact)}
                   </ChatHeaderStatus>
                   <div className="acpmux-handoff-header-tools" ref={tabRowTools}>
-                    {snapshot.presence && <PresenceStack viewing={snapshot.presence.viewing} />}
+                    <LivePresenceStack fallback={snapshot.presence} />
                     {inTabRow && (
                       <ChatHeaderInlineStatus status={header.status} detail={header.detail}>
                         {environmentSurface.header && environmentLine(environmentSurface.compact)}
@@ -9711,7 +9712,7 @@ function AcpmuxPane() {
                   </div>
                 )}
                 {hostErrorCard}
-                {snapshot.presence && <TypingLine typing={snapshot.presence.typing} />}
+                <LiveTypingLine fallback={snapshot.presence} />
                 {composer}
               </div>
             </>

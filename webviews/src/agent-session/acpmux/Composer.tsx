@@ -94,6 +94,26 @@ const STOP_GUARD_MS = 600;
 
 /// How often at most a new chat's text goes to the host while the person types (`onUnsentDraft`).
 const UNSENT_DRAFT_INTERVAL_MS = 300;
+/// A field change this soon after the person's key, text input or composition is their edit.
+const TYPED_WINDOW_MS = 250;
+/// Keys that move, leave or modify, never edit: a change after one is not typing.
+const NOT_AN_EDIT_KEY = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+  "Escape",
+  "Tab",
+  "Shift",
+  "Meta",
+  "Alt",
+  "Control",
+  "CapsLock",
+]);
 
 export type ComposerEditCommand = "cut" | "copy" | "paste" | "pasteAsPlainText";
 
@@ -431,6 +451,9 @@ export function Composer({
     [],
   );
   const pendingCaret = useRef<number | undefined>(undefined);
+  /// When the person last pressed an editing key, input text or composed: a field change soon
+  /// after is theirs (typing), any other is applied from outside.
+  const typedAt = useRef(Number.NEGATIVE_INFINITY);
   const prompts = usePromptHistory(snapshot.rows);
   // Send becomes Stop in place once the turn starts; a second click of a
   // double-click, or a click right after Enter, must not cancel the new turn.
@@ -561,6 +584,8 @@ export function Composer({
     handle,
     () => ({
       restore(restoredText, restoredAttachments) {
+        // Put back, not typed: the Enter that sent it says nothing about this change.
+        typedAt.current = Number.NEGATIVE_INFINITY;
         // What comes back goes first; what was typed or attached since stays after it.
         const typed = field.current?.value() ?? "";
         const next = typed.trim() ? `${restoredText}\n\n${typed}` : restoredText;
@@ -820,6 +845,8 @@ export function Composer({
     setText(value);
     setCaret(at);
     setDismissed(undefined);
+    // Emptied (a command run, a prompt sent, the text deleted): this pane no longer types.
+    if (!value.trim() && sessionId) onTyping?.("");
   };
   const pick = (command: SlashCommand) => {
     const next = applyCommand(text, caret, command);
@@ -923,6 +950,8 @@ export function Composer({
       return true;
     }
     const fromSend = document.activeElement?.classList.contains("acpmux-send") ?? false;
+    // The key that sent it is spent: what the composer writes back after the send is not typing.
+    typedAt.current = Number.NEGATIVE_INFINITY;
     unsentDraft.current?.flush();
     const sent = attachments;
     const taken = onSend(prompt, sent, steer);
@@ -1266,21 +1295,30 @@ export function Composer({
   };
 
   promptBeforeInput.current = (data, state) => {
+    typedAt.current = performance.now();
     // `!` first: shell mode, in place. A pasted `!cmd` keeps what follows the `!`.
     if (!onShell || state.composing || !state.empty || !data.startsWith("!")) return false;
     enterShell(data.slice(1));
     return true;
   };
-  // Only the person's own edit is typing (the field reports no value applied from outside): a
-  // chat's draft coming back, on open or on a switch, is not.
+  // Only the person's own edit is typing: a change right after their keystroke, text input or
+  // IME composition. A value applied from outside (a draft coming back on open or a switch, a
+  // failed prompt restored, the field normalizing either) comes with none.
   promptChange.current = (value, at) => {
     edit(value, at);
-    if (sessionId) onTyping?.(value);
+    if (performance.now() - typedAt.current >= TYPED_WINDOW_MS) return;
+    // One change per key: what the field does after it (normalizing) is not another.
+    typedAt.current = Number.NEGATIVE_INFINITY;
+    if (sessionId && value.trim()) onTyping?.(value);
   };
   promptCaret.current = setCaret;
-  promptKeyDown.current = keyDown;
+  promptKeyDown.current = (event) => {
+    if (!NOT_AN_EDIT_KEY.has(event.key)) typedAt.current = performance.now();
+    return keyDown(event);
+  };
   promptReturnInput.current = returnInput;
   promptComposition.current = (value) => {
+    typedAt.current = performance.now();
     composing.current = value;
   };
 

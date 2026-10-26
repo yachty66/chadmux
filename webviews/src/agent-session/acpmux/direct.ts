@@ -76,6 +76,7 @@ import { pasteRanges } from "./conversation/promptCollapse";
 import { AskTracker, pendingReader, SIDE_SESSION_METHOD } from "./needsYou/asks";
 import { chatTools, toolApplied, type ToolApplied } from "./summary/chatTools";
 import { taskGoal } from "./goal";
+import { shownPresence } from "./multiplayer/LivePresence";
 import { PresenceClient } from "./multiplayer/presenceClient";
 import { recordedConversationEvents } from "./conversation/exportEvents";
 import { markPullRequestActivityVersion, pullRequestRowKey } from "./summary/transcriptPullRequests";
@@ -1238,10 +1239,12 @@ export class AcpmuxDirectClient {
     () => this.emit(),
   );
   /// Who else is in a shared chat and who types there (multiplayer/presenceClient.ts). Nothing
-  /// crosses while acpmux sends no `presence` on attach.
+  /// crosses while acpmux sends no `presence` on attach. A change goes to the header faces and the
+  /// typing line alone (multiplayer/LivePresence.tsx), never through the snapshot: a teammate
+  /// typing redraws no transcript.
   readonly presence = new PresenceClient(
     (method, params) => this.request(method, params, 15000),
-    () => this.emit(),
+    () => shownPresence.set(this.presence.presence),
   );
   readonly permissions = new PermissionGroupClient(
     (method, params) => this.request(method, params, 15000),
@@ -1661,8 +1664,8 @@ export class AcpmuxDirectClient {
   /** Drops everything that belongs to the previously selected session, before another one attaches. */
   private resetSessionState(): void {
     // Typing and presence stop with the chat at once, not when the next attach lands: a keystroke
-    // meanwhile never reaches the chat before. The caller draws the change.
-    this.presence.detached(true);
+    // meanwhile never reaches the chat before.
+    this.presence.detached();
     // The chats started from the chat before are no longer watched.
     this.offerChildren.reset(this.socket?.readyState === WebSocket.OPEN);
     clearTimeout(this.stopTimer);
@@ -3848,9 +3851,6 @@ export class AcpmuxDirectClient {
       peerKinds: this.peerKinds,
       peerConnected: this.peerConnected,
       ...(this.forkedAtSeq !== undefined ? { forkedAtSeq: this.forkedAtSeq } : {}),
-      ...(this.presence.presenceOf(this.selectedSessionId)
-        ? { presence: this.presence.presenceOf(this.selectedSessionId) }
-        : {}),
       summary: summary
         ? {
             sessionId: summary.sessionId,

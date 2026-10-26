@@ -122,13 +122,12 @@ export class PresenceClient {
     this.stopRetry = undefined;
   }
 
-  /// The pane leaves the chat (a switch or close). `quiet`: the caller draws the change itself.
-  detached(quiet = false): void {
+  /// The pane leaves the chat (a switch or close).
+  detached(): void {
     this.stopTyping();
     this.sessionId = undefined;
     this.supported = false;
-    if (quiet) this.current = { viewing: [], typing: [] };
-    else this.set({ viewing: [], typing: [] });
+    this.set({ viewing: [], typing: [] });
   }
 
   private set(next: ChatPresence): void {

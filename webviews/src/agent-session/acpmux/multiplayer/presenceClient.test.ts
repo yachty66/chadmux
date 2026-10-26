@@ -101,7 +101,7 @@ test("a detached pane's keystrokes reach no chat until the next attach", () => {
   presence.attached("s1", { presence: { sessionId: "s1", participants: [me] } });
   presence.typed("h");
   // A switch: the chat before hears the off at once, then nothing while the next attach is pending.
-  presence.detached(true);
+  presence.detached();
   expect(sent).toEqual([
     { sessionId: "s1", on: true },
     { sessionId: "s1", on: false },

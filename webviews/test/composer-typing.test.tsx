@@ -1,12 +1,15 @@
 // Chat multiplayer (Leo 2026-10-26: "we can still do the regular chat multiplayer"): the pane tells
-// a shared chat's other people it types only when the person edits the prompt. A chat's draft
-// coming back (read from the daemon on open, or the remount cache on a switch) is not typing.
+// a shared chat's other people it types only when the person edits the prompt. A value applied
+// from outside is not typing: a chat's draft coming back (read from the daemon on open, with the
+// field's own normalizing, or the remount cache on a switch), or a failed prompt restored. Every
+// clear says it stopped.
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { JSDOM } from "jsdom";
-import { act } from "react";
+import { act, createRef } from "react";
 import type { Root } from "react-dom/client";
 import { noChat } from "../src/gallery/fixtures/acpmux";
 import type { MarkdownFieldElement } from "../src/agent-session/acpmux/MarkdownField";
+import type { ComposerHandle } from "../src/agent-session/acpmux/Composer";
 import { writePersistedDraft } from "../src/agent-session/acpmux/composerDraft";
 
 const scope = globalThis as Record<string, unknown>;
@@ -84,7 +87,7 @@ function Chips() {
   return null;
 }
 
-async function render(sessionId: string, typed: string[]) {
+async function render(sessionId: string, typed: string[], handle = createRef<ComposerHandle>()) {
   const { createRoot } = await import("react-dom/client");
   const { Composer } = await import("../src/agent-session/acpmux/Composer");
   const snapshot = noChat([], {
@@ -103,12 +106,14 @@ async function render(sessionId: string, typed: string[]) {
         onProject={() => {}}
         onNewChat={() => {}}
         onTyping={(text) => typed.push(text)}
+        handle={handle}
         localName="studio"
         projectChoices={[{ cwd: "/Users/you/src/app", label: "app" }]}
       />,
     ),
   );
   await until(() => !!host.querySelector('[role="combobox"]'), "the editor");
+  return handle;
 }
 
 async function until(ready: () => boolean, what: string) {
@@ -137,7 +142,8 @@ test("a draft read back from the daemon on open is not typing; an edit is", asyn
     await until(() => prompt() === "half a thought", "the restored draft");
     await settle();
     expect(typed).toEqual([]);
-    await act(async () => markdownField().type("half a thought, finished"));
+    await act(async () => markdownField().setCaret(Number.MAX_SAFE_INTEGER));
+    await act(async () => markdownField().insertTyped(", finished"));
     await until(() => typed.length > 0, "the edit");
     expect(typed.at(-1)).toBe("half a thought, finished");
   } finally {
@@ -149,11 +155,42 @@ test("a switch to a chat whose draft the page kept is not typing", async () => {
   writePersistedDraft("typing-b", "kept for b");
   const typed: string[] = [];
   await render("typing-a", typed);
-  await act(async () => markdownField().type("for a"));
+  await act(async () => markdownField().insertTyped("for a"));
   await until(() => typed.length > 0, "the edit");
   typed.length = 0;
   await render("typing-b", typed);
   await until(() => prompt() === "kept for b", "chat b's draft");
+  await settle();
+  expect(typed).toEqual([]);
+});
+
+test("a draft whose trailing space the field normalizes is not typing", async () => {
+  page().cmuxAcpmuxActions = { "chat.readDraft": async () => ({ draft: "half a thought " }) };
+  try {
+    const typed: string[] = [];
+    await render("typing-trailing", typed);
+    await until(() => prompt().startsWith("half a thought"), "the restored draft");
+    await settle();
+    await settle();
+    expect(typed).toEqual([]);
+  } finally {
+    delete page().cmuxAcpmuxActions;
+  }
+});
+
+test("a failed prompt put back is not typing, and a send's clear says it stopped", async () => {
+  const typed: string[] = [];
+  const handle = await render("typing-sent", typed);
+  await act(async () => markdownField().insertTyped("ship it"));
+  await until(() => typed.at(-1) === "ship it", "the edit");
+  // Sent: the composer clears itself, so this pane stops typing.
+  await act(async () => void handle.current!.send());
+  await until(() => prompt() === "", "the clear");
+  expect(typed.at(-1)).toBe("");
+  // The send failed and the prompt comes back: not the person's keystroke.
+  typed.length = 0;
+  await act(async () => handle.current!.restore("ship it", []));
+  await until(() => prompt() === "ship it", "the restored prompt");
   await settle();
   expect(typed).toEqual([]);
 });
