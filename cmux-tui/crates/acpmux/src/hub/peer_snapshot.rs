@@ -12,7 +12,8 @@
 //! Which copy may grow (the generation is the session's `createdAt`):
 //! - The peer's session list (`listed`, from its full lists and changed rows) says which
 //!   generation of each session is current. A copy of another generation, or of a session it no
-//!   longer lists, goes.
+//!   longer lists, goes. A purged generation (`barred`) is not listed again until a full list
+//!   leaves the session out (the peer has done the purge, so no older list can come after).
 //! - Each op names the link it came on (`Link`: the peer instance and its link epoch); one of an
 //!   older link than the newest the store has seen of that peer is not kept, however late it is.
 //! - A copy covers a run of seqs (`first_seq..=last_seq`: every record of them a page held). A page
@@ -32,12 +33,13 @@
 //! [`TOTAL_BYTES`] on disk, every file and every refused removal counted (the least recently used
 //! copy goes, and with nothing left to evict a write waits); [`MEMORY_BYTES`] of records in memory
 //! (written copies are unloaded first, then the least recently used unwritten one goes);
-//! a flush waits in the queue at most once per peer until the thread takes it (the queue's own
-//! bound comes with purges, next). A failed write is logged and tried again,
+//! [`QUEUED_BYTES`] of ops waiting for the thread, each counted at least [`OP_BYTES`] and reserved
+//! before it is sent (past it every copy of the op's peer goes, never a copy with a hole, until it
+//! lists again; a loss and a flush are sent at most once per peer until the thread takes them). A failed write is logged and tried again,
 //! 1 s doubling to 60 s (`daemon/persist_retry.rs`), never an exit; a refused removal, and a disk
 //! that cannot be read, are tried again the same way. Nothing is written or removed until the
-//! directory reads as this user's own (no symlink), and what was listed meanwhile is applied to
-//! what it holds (`Store::admits`).
+//! directory reads as this user's own (no symlink), and what was purged, removed or unlisted
+//! meanwhile is applied to what it holds (`Store::admits`).
 //! The hub's taps (what it sends the store) come next; until then nothing outside the tests
 //! uses it.
 //! A leased peer (a Cloud VM) is kept too: what a lease must not leave behind is its URL, port and
@@ -63,6 +65,8 @@ pub(crate) const FILE_BYTES: u64 = SESSION_BYTES + HEAD_BYTES;
 pub(crate) const TOTAL_BYTES: u64 = if cfg!(test) { 40 << 10 } else { 64 << 20 };
 /// Bytes of records held in memory, every copy together.
 const MEMORY_BYTES: u64 = if cfg!(test) { 24 << 10 } else { 16 << 20 };
+/// Bytes of captures sent to the store's thread and not yet taken.
+const QUEUED_BYTES: u64 = if cfg!(test) { 64 << 10 } else { 16 << 20 };
 /// How long new records wait before their write, so a streaming turn writes every few seconds,
 /// not on every token.
 const FLUSH_AFTER: Duration = Duration::from_millis(if cfg!(test) { 10 } else { 2000 });
@@ -128,16 +132,39 @@ impl Page {
 }
 
 enum Op {
-    Listed { peer: String, rows: Vec<(String, Option<u64>)>, full: bool },
+    Listed {
+        peer: String,
+        rows: Vec<(String, Option<u64>)>,
+        full: bool,
+    },
+    Gone {
+        key: Key,
+        generation: Option<u64>,
+    },
+    ForgetPeer(String),
     Lagged(String),
-    Page { key: Key, page: Page },
-    Record { key: Key, link: Link, record: Value },
-    Flush { peer: Option<String>, done: Option<mpsc::SyncSender<()>> },
+    Page {
+        key: Key,
+        page: Page,
+    },
+    Record {
+        key: Key,
+        link: Link,
+        record: Value,
+    },
+    /// An op of the peer did not fit the queue: what it would have changed goes instead.
+    LostPeer(String),
+    Flush {
+        peer: Option<String>,
+        done: Option<mpsc::SyncSender<()>>,
+    },
 }
 
-/// The flushes sent and not yet taken: each is sent once until the thread takes it.
+/// The peers whose ops did not fit the queue, and the flushes sent: each is sent once until the
+/// thread takes it, so they are bounded by the peers.
 #[derive(Default)]
 struct Dropped {
+    peers: HashSet<String>,
     flushes: HashSet<Option<String>>,
 }
 
@@ -161,7 +188,7 @@ impl PeerSnapshots {
         }
     }
 
-    /// Sends `op` costing `cost` (a flush: bounded by `Dropped`).
+    /// Sends `op` costing `cost` (a loss or a flush: bounded by `Dropped`, so never refused).
     fn send(&self, cost: u64, op: Op) -> bool {
         self.queued.fetch_add(cost, Ordering::AcqRel);
         self.enqueue(cost, op)
@@ -191,30 +218,75 @@ impl PeerSnapshots {
         sent
     }
 
+    /// Counts `cost` more in `queued` when it fits [`QUEUED_BYTES`], in one step, so callers on
+    /// several threads never pass it together. Answers whether it did.
+    fn reserve(&self, cost: u64) -> bool {
+        let fits = |q: u64| (q + cost <= QUEUED_BYTES).then_some(q + cost);
+        self.queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, fits).is_ok()
+    }
+
     fn dropped(&self) -> std::sync::MutexGuard<'_, Dropped> {
         self.dropped.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sends `op` of peer `peer` costing `cost`. Past [`QUEUED_BYTES`] it is dropped and a loss of
+    /// the peer goes in its place (`Op::LostPeer`): every copy of the peer goes, and nothing of it
+    /// is kept until it lists again. While the loss waits for the thread nothing more of the peer
+    /// is sent: the loss stands for all of it, so losses are bounded by the peers. One lock holds
+    /// the check, the loss and the send, so nothing sent after a loss stands before it.
+    fn admit(&self, peer: &str, cost: u64, op: impl FnOnce() -> Op) {
+        if self.dir.is_none() {
+            return;
+        }
+        let mut dropped = self.dropped();
+        if dropped.peers.contains(peer) {
+            return;
+        }
+        if self.reserve(cost) {
+            self.enqueue(cost, op());
+            return;
+        }
+        dropped.peers.insert(peer.to_owned());
+        tracing::warn!(peer, "peer snapshot: captures fell behind; this peer's copies go");
+        self.send(OP_BYTES, Op::LostPeer(peer.to_owned()));
     }
 
     /// The generations peer `peer` lists now: every session (`full`) or the ones that changed.
     pub(crate) fn listed(&self, peer: &str, rows: Vec<(String, Option<u64>)>, full: bool) {
         let cost = OP_BYTES + rows.iter().map(|(m, _)| m.len() as u64 + 16).sum::<u64>();
-        self.send(cost, Op::Listed { peer: peer.to_owned(), rows, full });
+        self.admit(peer, cost, || Op::Listed { peer: peer.to_owned(), rows, full });
+    }
+
+    /// Session `mux` of `peer` was purged: its copy goes, and `generation` (None: any) is not
+    /// kept again.
+    pub(crate) fn gone(&self, peer: &str, mux: &str, generation: Option<u64>) {
+        let key = (peer.to_owned(), mux.to_owned());
+        self.admit(peer, OP_BYTES, || Op::Gone { key, generation });
+    }
+
+    /// Peer `peer` was removed: all of its copies go.
+    pub(crate) fn forget_peer(&self, peer: &str) {
+        self.admit(peer, OP_BYTES, || Op::ForgetPeer(peer.to_owned()));
     }
 
     /// Peer `peer`'s link dropped notifications: no live record is taken until a page again.
     pub(crate) fn lagged(&self, peer: &str) {
-        self.send(OP_BYTES, Op::Lagged(peer.to_owned()));
+        self.admit(peer, OP_BYTES, || Op::Lagged(peer.to_owned()));
     }
 
     pub(crate) fn page(&self, (peer, mux): (&str, &str), page: Page) {
         let row = page.row.as_ref().map_or(0, record_bytes);
         let cost = OP_BYTES + row + page.records.iter().map(record_bytes).sum::<u64>();
-        self.send(cost, Op::Page { key: (peer.to_owned(), mux.to_owned()), page });
+        self.admit(peer, cost, || Op::Page { key: (peer.to_owned(), mux.to_owned()), page });
     }
 
     pub(crate) fn record(&self, (peer, mux): (&str, &str), link: Link, record: Value) {
         let cost = OP_BYTES + record_bytes(&record);
-        self.send(cost, Op::Record { key: (peer.to_owned(), mux.to_owned()), link, record });
+        self.admit(peer, cost, || Op::Record {
+            key: (peer.to_owned(), mux.to_owned()),
+            link,
+            record,
+        });
     }
 
     /// Writes what is not written yet, of peer `peer` (None: every peer), without waiting.
@@ -322,6 +394,13 @@ struct Store {
     listed: HashMap<Key, Option<u64>>,
     /// Peers whose full list came this run: a session they do not list is not theirs any more.
     full_listed: HashSet<String>,
+    barred: HashMap<Key, Option<u64>>,
+    /// Peers removed before the disk was read (or whose ops were lost then): their files go
+    /// when it is.
+    forgotten: HashSet<String>,
+    /// Sessions whose copy went before the disk was read (purged, unlisted, replaced, lost):
+    /// what an earlier run kept of them goes too when it is.
+    unread: HashSet<Key>,
     /// The newest link each peer was seen on: anything of an older one comes too late.
     links: HashMap<String, Link>,
     /// Removals the filesystem refused, with their bytes, and when they are tried again.
@@ -351,6 +430,9 @@ impl Store {
             copies: HashMap::new(),
             listed: HashMap::new(),
             full_listed: HashSet::new(),
+            barred: HashMap::new(),
+            forgotten: HashSet::new(),
+            unread: HashSet::new(),
             links: HashMap::new(),
             dead: HashMap::new(),
             dead_retry: None,
@@ -396,6 +478,26 @@ impl Store {
     fn take(&mut self, op: Op) {
         match op {
             Op::Listed { peer, rows, full } => self.take_listed(&peer, rows, full),
+            Op::Gone { key, generation } => {
+                // A purge names the generation it removed: a newer one listed or kept since (the
+                // session recreated) stays. One that names none removes whatever there is.
+                let newer = |g: Option<u64>| matches!((g, generation), (Some(g), Some(p)) if g > p);
+                if !self.listed.get(&key).is_some_and(|l| newer(*l)) {
+                    self.listed.remove(&key);
+                }
+                let bar = match (self.barred.get(&key), generation) {
+                    (Some(Some(a)), Some(b)) => Some((*a).max(b)),
+                    (None, g) => g,
+                    _ => None,
+                };
+                self.barred.insert(key.clone(), bar);
+                // Before the disk reads, the bar alone says what an earlier run kept of it that
+                // goes: a newer generation there stays too.
+                if !self.copies.get(&key).is_some_and(|c| newer(c.head.generation)) {
+                    self.discard(&key);
+                }
+            }
+            Op::ForgetPeer(peer) => self.forget_peer(&peer),
             Op::Lagged(peer) => {
                 for (_, c) in self.copies.iter_mut().filter(|(k, _)| k.0 == peer) {
                     c.epoch = None;
@@ -403,6 +505,20 @@ impl Store {
             }
             Op::Page { key, page } => self.take_page(&key, page),
             Op::Record { key, link, record } => self.take_record(&key, link, record),
+            Op::LostPeer(peer) => {
+                self.dropped.lock().unwrap_or_else(|e| e.into_inner()).peers.remove(&peer);
+                // What it changed is not known: nothing of the peer is kept until it lists again.
+                let keys: Vec<Key> = self.copies.keys().filter(|k| k.0 == peer).cloned().collect();
+                for key in keys {
+                    self.remove(&key);
+                }
+                self.listed.retain(|k, _| k.0 != peer);
+                self.full_listed.remove(&peer);
+                if !self.scanned {
+                    // Nor what an earlier run kept of it, once the disk reads.
+                    self.forgotten.insert(peer);
+                }
+            }
             Op::Flush { peer, done } => {
                 if done.is_none() {
                     self.dropped.lock().unwrap_or_else(|e| e.into_inner()).flushes.remove(&peer);
@@ -415,11 +531,32 @@ impl Store {
         }
     }
 
+    fn forget_peer(&mut self, peer: &str) {
+        let keys: Vec<Key> = self.copies.keys().filter(|k| k.0 == peer).cloned().collect();
+        for key in keys {
+            self.remove(&key);
+        }
+        self.listed.retain(|k, _| k.0 != peer);
+        self.barred.retain(|k, _| k.0 != peer);
+        self.full_listed.remove(peer);
+        self.links.remove(peer);
+        if self.scanned {
+            // Its files went one by one above; the directory goes only once it is empty, so a
+            // peer added again under the name never loses a copy to a removal tried later.
+            if let Some(dir) = disk::peer_dir(&self.root, peer) {
+                let _ = std::fs::remove_dir(dir);
+            }
+        } else {
+            self.forgotten.insert(peer.to_owned());
+        }
+    }
+
     fn take_listed(&mut self, peer: &str, rows: Vec<(String, Option<u64>)>, full: bool) {
         if full {
             let names: HashSet<&str> = rows.iter().map(|(m, _)| m.as_str()).collect();
             let unlisted = |k: &Key| k.0 == peer && !names.contains(k.1.as_str());
             self.listed.retain(|k, _| !unlisted(k));
+            self.barred.retain(|k, _| !unlisted(k));
             let drop: Vec<Key> = self.copies.keys().filter(|k| unlisted(k)).cloned().collect();
             for key in drop {
                 self.remove(&key);
@@ -428,6 +565,14 @@ impl Store {
         }
         for (mux, generation) in rows {
             let key = (peer.to_owned(), mux);
+            if let Some(bar) = self.barred.get(&key).copied() {
+                // A purged generation listed again by a list sent before the purge: nothing of it
+                // is taken, and what the purge left (a newer generation listed or kept) stays.
+                if bar.is_none() || generation.is_none_or(|g| bar.is_some_and(|b| g <= b)) {
+                    continue;
+                }
+                self.barred.remove(&key);
+            }
             self.listed.insert(key.clone(), generation);
             let other = self
                 .copies
@@ -690,10 +835,18 @@ impl Store {
     }
 
     /// Whether a copy an earlier run kept of `key` (of `generation`) may stand, given what this
-    /// run was told before the disk could be read: not another generation than the listed one,
-    /// nor a session a full list left out.
+    /// run was told before the disk could be read: not of a removed peer, nor a purged
+    /// generation, nor another generation than the listed one, nor a session a full list left out.
     fn admits(&self, key: &Key, generation: Option<u64>) -> bool {
-        if self.copies.contains_key(key) {
+        if self.forgotten.contains(&key.0)
+            || self.unread.contains(key)
+            || self.copies.contains_key(key)
+        {
+            return false;
+        }
+        if let Some(bar) = self.barred.get(key)
+            && (bar.is_none() || generation.is_none_or(|g| bar.is_some_and(|b| g <= b)))
+        {
             return false;
         }
         match self.listed.get(key) {
@@ -734,12 +887,23 @@ impl Store {
                 _ => self.unlink(path, bytes),
             }
         }
+        self.forgotten.clear();
+        self.unread.clear();
         self.evict_disk(None, 0);
         true
     }
 
-    /// Removes `key`'s copy and its file.
+    /// Removes `key`'s copy and its file, and, before the disk reads, what an earlier run kept
+    /// of it.
     fn remove(&mut self, key: &Key) {
+        if !self.scanned {
+            self.unread.insert(key.clone());
+        }
+        self.discard(key);
+    }
+
+    /// Removes `key`'s copy and its file.
+    fn discard(&mut self, key: &Key) {
         let Some(c) = self.copies.remove(key) else { return };
         self.memory -= c.memory;
         if c.disk > 0
